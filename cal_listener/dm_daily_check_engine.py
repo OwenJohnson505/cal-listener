@@ -3750,7 +3750,14 @@ def _process_one_view_subprocess(view_name, no_clipboard=False):
     process exits - if the child died mid-print, capture_output preserves
     whatever made it into the pipe. Inheriting stdio was losing this on
     native crashes."""
-    cmd = [sys.executable, "-u", str(Path(__file__)), "--view", view_name]
+    # Under a PyInstaller --onefile build, sys.executable is the listener
+    # .exe and __file__ is a temp path that can't be re-launched directly.
+    # Detect frozen mode and re-launch THIS same .exe with a sentinel arg;
+    # cal_listener/__main__.py routes that back to _process_one_view_inline.
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable, "--engine-view", view_name]
+    else:
+        cmd = [sys.executable, "-u", str(Path(__file__)), "--view", view_name]
     if no_clipboard:
         cmd.append("--no-clipboard")
     env = dict(os.environ)

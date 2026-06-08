@@ -49,6 +49,16 @@ def main():
         # only reliable way to make them work after PyInstaller bundling.
         "--collect-all", "pywinauto",
         "--collect-all", "comtypes",
+        # openpyxl is used by the bundled dm_daily_check_engine.py for
+        # the rules workbook + review xlsx output. Without --collect-all
+        # PyInstaller misses the dynamic submodules and openpyxl errors
+        # out at runtime.
+        "--collect-all", "openpyxl",
+        # PIL is used optionally for the OCR header screenshot. The
+        # engine try/excepts it and falls back to the v2 dm_columns
+        # resolver, but bundling it costs nothing and avoids a noisy
+        # warning at startup.
+        "--collect-all", "PIL",
         "--hidden-import", "psutil",
         "--hidden-import", "win32api",
         "--hidden-import", "win32con",
