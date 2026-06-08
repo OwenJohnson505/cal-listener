@@ -1,125 +1,184 @@
-"""DM Daily Check — minimal first-port.
+"""DM Daily Check — runs the desktop scraper verbatim.
 
-Walks the Booking → In Progress page, iterates each filter view,
-copies each grid via Ctrl+A → Ctrl+C, parses the TSV, and writes
-the rows to Supabase shared_rows under dataset 'dm_daily_check'.
+Strategy: the desktop CalToolkit has a battle-tested 4000-line
+`dm_daily_check.py` that already handles grid focus, Telerik virtualisation,
+clipboard timing, OCR column detection, scroll-mode fallback, and per-view
+crash isolation via subprocesses.
 
-This is a MINIMUM-VIABLE port — it doesn't yet do:
-  * flagging rules (overdue + missing cust ref)
-  * decision history merging
-  * AI verdicts
-  * email generation
-  * scroll-mode fallback for views the clipboard mode can't read
+Instead of rebuilding all that from scratch in the listener, we copied
+the file verbatim into `cal_listener/dm_daily_check_engine.py` and
+`cal_listener/dm_columns.py`. This handler:
 
-Those are layered on top of this in subsequent ports. This one just
-proves we can drive DM end-to-end and put real data into Supabase.
+  1. Calls `dm.ensure_logged_in()` to make sure DM is open + signed in.
+  2. Runs the engine script as a subprocess.
+  3. Streams its stdout into the listener's on_progress callback so the
+     user sees real progress in the web UI.
+  4. After the subprocess exits, reads every `view_results/*.json` file
+     it left behind and uploads each row to Supabase `shared_rows` under
+     dataset `dm_daily_check`.
+
+The engine writes per-view JSON files as soon as each view finishes — so
+even a partial run still produces useful data.
 """
 from __future__ import annotations
 
 import hashlib
+import json
+import subprocess
+import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict
 
 from .. import dm
-from .. import grid as g
 
-# The 5 production filter views + the Complete view for completeness.
-# Each is a Button on the In Progress page in DM.
-DEFAULT_VIEWS = ["In Progress", "Katie", "Steven", "Kyle", "Jamie C", "Complete"]
+
+# Path to the engine script we copied from desktop CalToolkit.
+ENGINE_SCRIPT = Path(__file__).resolve().parent.parent / "dm_daily_check_engine.py"
 
 
 def _row_key(view: str, idx: int, row: dict) -> str:
     """Stable key per (view, ref-or-fallback). Lets repeat scrapes overwrite
     the same row instead of duplicating."""
-    # Try the first cell that looks like a BT ref, fall back to a hash.
-    for v in row.values():
-        if isinstance(v, str) and v.startswith("BT") and len(v) <= 12:
-            return f"{view.replace(' ', '_').lower()}-{v}"
-    raw = "|".join(str(row.get(i, "")) for i in range(8))
+    # The desktop engine stores rows with named keys like 'ref', 'customer',
+    # 'cust_ref', 'del_date' — much richer than the raw col_N indices.
+    ref = row.get("ref") or row.get("Ref") or ""
+    if isinstance(ref, str) and ref.startswith("BT") and len(ref) <= 12:
+        return f"{view.replace(' ', '_').lower()}-{ref}"
+    raw = json.dumps(row, sort_keys=True, default=str)
     return (f"{view.replace(' ', '_').lower()}-row-{idx:04d}-"
             f"{hashlib.sha1(raw.encode()).hexdigest()[:8]}")
 
 
+def _stream_subprocess(cmd, on_progress):
+    """Run `cmd` and pipe every stdout line to on_progress.
+
+    Returns the subprocess exit code.
+    """
+    on_progress(f"[engine] running: {' '.join(str(c) for c in cmd)}",
+                level="info")
+
+    # Inherit the listener's environment so PYTHONPATH/site-packages match.
+    # No CREATE_NO_WINDOW — when running source-mode the user is watching
+    # the listener console window already; the engine output appears there.
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,  # line-buffered
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.rstrip()
+        if not line:
+            continue
+        # Mirror everything from the engine into the listener's
+        # progress feed so it appears live in the web UI.
+        on_progress(f"[engine] {line}", level="info")
+
+    proc.wait()
+    return proc.returncode
+
+
+def _read_view_results(results_dir: Path):
+    """Yield (view_name, parsed_json_dict) for every per-view JSON written
+    by the engine."""
+    if not results_dir.exists():
+        return
+    for path in sorted(results_dir.glob("*.json")):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as e:
+            yield (path.stem, {"_load_error": str(e)})
+            continue
+        yield (path.stem, payload)
+
+
 def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
-    views = params.get("views") or DEFAULT_VIEWS
+    """Listener entry point — called by the listener daemon with the
+    job's params dict."""
+
     summary: Dict[str, Any] = {
-        "views_attempted":  [],
         "views_succeeded":  [],
         "views_failed":     [],
-        "rows_total":       0,
+        "rows_uploaded":    0,
         "per_view":         {},
     }
 
-    # Step 1: bring DM up if needed.
+    if not ENGINE_SCRIPT.exists():
+        return {
+            "ok": False,
+            "error": f"engine script missing at {ENGINE_SCRIPT}",
+            "summary": summary,
+        }
+
+    # 1. Make sure DM is running + logged in. The engine's find_dm() will
+    # then attach to the same process. We don't reuse the pywinauto
+    # Application object — the engine creates its own (and isolates each
+    # view in a fresh subprocess for crash safety).
     on_progress("Ensuring DM is logged in and ready", percent=5)
-    app = dm.ensure_logged_in(ctx, on_progress=on_progress, timeout=120)
+    dm.ensure_logged_in(ctx, on_progress=on_progress, timeout=120)
+    # Give DM a moment to settle before we hand off to the engine.
+    time.sleep(1.0)
 
-    # Step 2: navigate Booking → In Progress.
-    on_progress("Navigating to Booking tab", percent=10)
-    ok, strategy = dm.click_nav_item(app, "Booking", on_progress=on_progress)
-    if not ok:
-        return {"ok": False, "error": "could not click 'Booking' tab",
-                "strategy": strategy, "summary": summary}
-    time.sleep(1.5)
+    # 2. Run the engine. This is the desktop's _orchestrator() entry
+    # point — it spawns one subprocess per filter view, each of which
+    # writes a JSON checkpoint as it completes.
+    on_progress("Starting DM Daily Check engine (desktop v46)", percent=10)
+    engine_dir = ENGINE_SCRIPT.parent
+    results_dir = engine_dir / "view_results"
 
-    on_progress("Navigating to In Progress", percent=15)
-    ok, strategy = dm.click_nav_item(app, "In Progress", on_progress=on_progress)
-    if not ok:
-        return {"ok": False, "error": "could not click 'In Progress'",
-                "strategy": strategy, "summary": summary}
-    time.sleep(2.0)
+    # Clear stale JSONs from a prior run so we don't double-upload.
+    if results_dir.exists():
+        for stale in results_dir.glob("*.json"):
+            try:
+                stale.unlink()
+            except Exception:
+                pass
 
-    main = app.window(title_re=dm.DM_TITLE_RE)
+    t0 = time.time()
+    rc = _stream_subprocess([sys.executable, str(ENGINE_SCRIPT)], on_progress)
+    elapsed = time.time() - t0
 
-    # Step 3: per filter view, click → wait → scrape → save.
-    total_views = len(views)
-    pct_start = 20
-    pct_per = (95 - pct_start) // max(total_views, 1)
+    on_progress(
+        f"Engine exited with code {rc} after {elapsed:.0f}s",
+        percent=85,
+        level="info" if rc == 0 else "warning",
+    )
 
-    for i, view in enumerate(views):
-        base_pct = pct_start + i * pct_per
-        on_progress(f"[{view}] selecting view", percent=base_pct)
-        summary["views_attempted"].append(view)
+    # 3. Read every per-view JSON the engine wrote and upload rows.
+    on_progress("Uploading scraped rows to Supabase", percent=88)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    total_uploaded = 0
 
-        ok, strategy = dm.click_nav_item(app, view, on_progress=on_progress)
-        if not ok:
-            on_progress(f"[{view}] view button not found — skipping",
-                        level="warning")
-            summary["views_failed"].append({"view": view, "reason": "nav-failed"})
-            summary["per_view"][view] = {"rows": 0, "skipped": True,
-                                         "reason": "nav-failed"}
+    for view_slug, payload in _read_view_results(results_dir):
+        view_name = payload.get("view", view_slug.replace("_", " "))
+
+        if "_load_error" in payload:
+            summary["views_failed"].append(
+                {"view": view_name, "reason": f"json-parse: {payload['_load_error']}"})
+            summary["per_view"][view_name] = {"rows": 0, "skipped": True}
+            on_progress(f"[{view_name}] couldn't read result JSON: "
+                        f"{payload['_load_error']}", level="warning")
             continue
 
-        # Telerik takes a moment to re-populate the grid after a view click.
-        time.sleep(2.5)
+        all_rows = payload.get("all_rows") or []
+        view_uploaded = 0
 
-        on_progress(f"[{view}] copying grid via clipboard…",
-                    percent=base_pct + 2)
-        rows = g.read_grid_via_clipboard(main, on_progress=on_progress)
-
-        if rows is None or not rows:
-            on_progress(f"[{view}] clipboard read failed",
-                        level="warning")
-            summary["views_failed"].append({"view": view,
-                                            "reason": "clipboard-empty"})
-            summary["per_view"][view] = {"rows": 0, "skipped": True,
-                                         "reason": "clipboard-empty"}
-            continue
-
-        on_progress(f"[{view}] read {len(rows)} rows — saving to Supabase",
-                    percent=base_pct + 4)
-
-        now_iso = datetime.now(timezone.utc).isoformat()
-        saved = 0
-        for idx, row in enumerate(rows):
-            row_key = _row_key(view, idx, row)
+        for idx, row in enumerate(all_rows):
+            row_key = _row_key(view_name, idx, row)
             data = {
-                "view":         view,
+                "view":         view_name,
                 "scraped_at":   now_iso,
                 "scraped_by":   ctx.settings.listener_id,
                 "row_index":    idx,
-                **{f"col_{k}": v for k, v in row.items()},
+                **row,
             }
             try:
                 ctx.sb.upsert("shared_rows", {
@@ -127,28 +186,38 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
                     "row_key": row_key,
                     "data":    data,
                 })
-                saved += 1
+                view_uploaded += 1
             except Exception as e:
-                on_progress(f"[{view}] save row {idx} failed: {e}",
+                on_progress(f"[{view_name}] upload row {idx} failed: {e}",
                             level="warning")
 
-        summary["views_succeeded"].append(view)
-        summary["rows_total"] += saved
-        summary["per_view"][view] = {"rows": saved, "skipped": False}
-        on_progress(f"[{view}] DONE — saved {saved} rows", percent=base_pct + pct_per)
+        total_uploaded += view_uploaded
+        summary["views_succeeded"].append(view_name)
+        summary["per_view"][view_name] = {
+            "rows":           view_uploaded,
+            "engine_rows":    len(all_rows),
+            "expected_total": payload.get("expected_total"),
+            "missing_count":  payload.get("missing_count"),
+            "partial":        payload.get("partial", False),
+        }
+        on_progress(
+            f"[{view_name}] uploaded {view_uploaded}/{len(all_rows)} rows",
+            level="info",
+        )
 
-    on_progress(
-        f"Finished — {len(summary['views_succeeded'])}/{total_views} views, "
-        f"{summary['rows_total']} rows saved",
-        percent=100)
+    summary["rows_uploaded"] = total_uploaded
+
+    final_msg = (
+        f"Done — {len(summary['views_succeeded'])} views, "
+        f"{total_uploaded} rows uploaded to Supabase."
+    )
+    on_progress(final_msg, percent=100)
 
     return {
-        "ok": True,
+        "ok": rc == 0 and total_uploaded > 0,
+        "exit_code": rc,
+        "elapsed_seconds": round(elapsed, 1),
         "summary": summary,
         "listener_id": ctx.settings.listener_id,
-        "message": (
-            f"Pulled {summary['rows_total']} rows across "
-            f"{len(summary['views_succeeded'])} views. Check the DM Daily "
-            "Check page in the web app to see them."
-        ),
+        "message": final_msg,
     }
