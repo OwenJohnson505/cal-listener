@@ -39,7 +39,10 @@ def main():
         "--noconfirm",
         "--onefile",
         "--name", "CalListener",
-        "--windowed",                          # no console window
+        # CONSOLE mode (no --windowed): we want a visible terminal window
+        # so the user can SEE the listener is running, watch the heartbeat
+        # log scroll, and close the window to stop it. The first-run
+        # tkinter dialog still pops up over the console.
         "--collect-all", "cal_listener",       # bundle all submodules
         # pywinauto + pywin32 do TONS of dynamic submodule loading.
         # --collect-all on each pulls the whole tree, which is the

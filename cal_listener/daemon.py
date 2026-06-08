@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from .secrets import Settings, load_or_prompt, secrets_dir
+from .singleton import ensure_single_instance
 from .supabase import Supabase
 from .handlers import HANDLERS, JobCancelled
 
@@ -215,7 +216,18 @@ class HandlerContext:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # Singleton check FIRST — if another copy is already running, bail out
+    # quietly so accidental double-clicks don't spawn duplicate workers.
+    if not ensure_single_instance():
+        print("[cal_listener] another instance is already running — exiting.")
+        sys.exit(0)
     settings = load_or_prompt()
+    print("=" * 60)
+    print(f" Cal Listener — running as '{settings.listener_id}'")
+    print(f" Heartbeat every {settings.heartbeat_seconds}s, poll every {settings.poll_seconds}s")
+    print(f" Log file: {_LOG_PATH}")
+    print(" Leave this window open. Close it to stop the listener.")
+    print("=" * 60)
     Listener(settings).run_forever()
 
 
