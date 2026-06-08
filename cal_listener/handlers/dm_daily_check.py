@@ -1,29 +1,29 @@
 """DM Daily Check — runs the desktop scraper verbatim.
 
-Strategy: the desktop CalToolkit has a battle-tested 4000-line
-`dm_daily_check.py` that already handles grid focus, Telerik virtualisation,
-clipboard timing, OCR column detection, scroll-mode fallback, and per-view
-crash isolation via subprocesses.
+The desktop CalToolkit has a battle-tested 4000-line `dm_daily_check.py`
+that handles grid focus, Telerik virtualisation, clipboard timing, OCR
+column detection, scroll-mode fallback, and per-view crash isolation
+via subprocesses. It's bundled into this listener as
+`cal_listener/dm_daily_check_engine.py` (+ `dm_columns.py`).
 
-Instead of rebuilding all that from scratch in the listener, we copied
-the file verbatim into `cal_listener/dm_daily_check_engine.py` and
-`cal_listener/dm_columns.py`. This handler:
+This handler:
 
-  1. Calls `dm.ensure_logged_in()` to make sure DM is open + signed in.
-  2. Runs the engine script as a subprocess.
-  3. Streams its stdout into the listener's on_progress callback so the
-     user sees real progress in the web UI.
-  4. After the subprocess exits, reads every `view_results/*.json` file
-     it left behind and uploads each row to Supabase `shared_rows` under
-     dataset `dm_daily_check`.
-
-The engine writes per-view JSON files as soon as each view finishes — so
-even a partial run still produces useful data.
+  1. Calls `dm.ensure_logged_in()` so DM is open + signed in.
+  2. Re-launches the listener .exe with `--engine-orchestrate` (or, in
+     source mode, runs `python dm_daily_check_engine.py`). That mode is
+     handled by `cal_listener/__main__.py` and routes to the engine's
+     orchestrator without taking the singleton mutex.
+  3. The orchestrator writes per-view JSON files into a stable workdir
+     (`%APPDATA%\\CalListener\\dm_workdir\\view_results`, or next to the
+     source script in dev mode).
+  4. After it exits, we read each JSON and upload rows to Supabase
+     `shared_rows` under dataset `dm_daily_check`.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import time
@@ -34,15 +34,34 @@ from typing import Any, Dict
 from .. import dm
 
 
-# Path to the engine script we copied from desktop CalToolkit.
+# Path to the engine script. In frozen mode this is inside the PyInstaller
+# temp extract; in source mode it sits next to this file's parent package.
 ENGINE_SCRIPT = Path(__file__).resolve().parent.parent / "dm_daily_check_engine.py"
 
 
+def _engine_workdir() -> Path:
+    """Where the engine writes per-view JSONs + final xlsx. Must match
+    the engine's HERE/SCRIPT_DIR resolution exactly."""
+    if getattr(sys, "frozen", False):
+        appdata = Path(os.environ.get("APPDATA", str(Path.home())))
+        return appdata / "CalListener" / "dm_workdir"
+    # Source mode: next to the engine script itself.
+    return ENGINE_SCRIPT.parent
+
+
+def _engine_command():
+    """The command we use to launch the engine orchestrator. In frozen
+    mode we re-exec the listener .exe with a sentinel flag that
+    cal_listener/__main__.py dispatches to the engine. In source mode
+    we just run the engine script directly with python."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--engine-orchestrate"]
+    return [sys.executable, "-u", str(ENGINE_SCRIPT)]
+
+
 def _row_key(view: str, idx: int, row: dict) -> str:
-    """Stable key per (view, ref-or-fallback). Lets repeat scrapes overwrite
-    the same row instead of duplicating."""
-    # The desktop engine stores rows with named keys like 'ref', 'customer',
-    # 'cust_ref', 'del_date' — much richer than the raw col_N indices.
+    """Stable key per (view, ref-or-fallback). Lets repeat scrapes
+    overwrite the same row instead of duplicating."""
     ref = row.get("ref") or row.get("Ref") or ""
     if isinstance(ref, str) and ref.startswith("BT") and len(ref) <= 12:
         return f"{view.replace(' ', '_').lower()}-{ref}"
@@ -53,21 +72,16 @@ def _row_key(view: str, idx: int, row: dict) -> str:
 
 def _stream_subprocess(cmd, on_progress):
     """Run `cmd` and pipe every stdout line to on_progress.
-
-    Returns the subprocess exit code.
-    """
+    Returns the subprocess exit code."""
     on_progress(f"[engine] running: {' '.join(str(c) for c in cmd)}",
                 level="info")
 
-    # Inherit the listener's environment so PYTHONPATH/site-packages match.
-    # No CREATE_NO_WINDOW — when running source-mode the user is watching
-    # the listener console window already; the engine output appears there.
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        bufsize=1,  # line-buffered
+        bufsize=1,
         encoding="utf-8",
         errors="replace",
     )
@@ -77,8 +91,6 @@ def _stream_subprocess(cmd, on_progress):
         line = line.rstrip()
         if not line:
             continue
-        # Mirror everything from the engine into the listener's
-        # progress feed so it appears live in the web UI.
         on_progress(f"[engine] {line}", level="info")
 
     proc.wait()
@@ -86,8 +98,8 @@ def _stream_subprocess(cmd, on_progress):
 
 
 def _read_view_results(results_dir: Path):
-    """Yield (view_name, parsed_json_dict) for every per-view JSON written
-    by the engine."""
+    """Yield (view_name, parsed_json_dict) for every per-view JSON the
+    engine left behind."""
     if not results_dir.exists():
         return
     for path in sorted(results_dir.glob("*.json")):
@@ -101,9 +113,6 @@ def _read_view_results(results_dir: Path):
 
 
 def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
-    """Listener entry point — called by the listener daemon with the
-    job's params dict."""
-
     summary: Dict[str, Any] = {
         "views_succeeded":  [],
         "views_failed":     [],
@@ -111,30 +120,17 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
         "per_view":         {},
     }
 
-    if not ENGINE_SCRIPT.exists():
-        return {
-            "ok": False,
-            "error": f"engine script missing at {ENGINE_SCRIPT}",
-            "summary": summary,
-        }
-
     # 1. Make sure DM is running + logged in. The engine's find_dm() will
-    # then attach to the same process. We don't reuse the pywinauto
-    # Application object — the engine creates its own (and isolates each
-    # view in a fresh subprocess for crash safety).
+    # then attach to the same process.
     on_progress("Ensuring DM is logged in and ready", percent=5)
     dm.ensure_logged_in(ctx, on_progress=on_progress, timeout=120)
-    # Give DM a moment to settle before we hand off to the engine.
     time.sleep(1.0)
 
-    # 2. Run the engine. This is the desktop's _orchestrator() entry
-    # point — it spawns one subprocess per filter view, each of which
-    # writes a JSON checkpoint as it completes.
-    on_progress("Starting DM Daily Check engine (desktop v46)", percent=10)
-    engine_dir = ENGINE_SCRIPT.parent
-    results_dir = engine_dir / "view_results"
-
-    # Clear stale JSONs from a prior run so we don't double-upload.
+    # 2. Resolve workdir + clear stale per-view JSONs.
+    workdir = _engine_workdir()
+    results_dir = workdir / "view_results"
+    workdir.mkdir(parents=True, exist_ok=True)
+    on_progress(f"Engine workdir: {workdir}", percent=8)
     if results_dir.exists():
         for stale in results_dir.glob("*.json"):
             try:
@@ -142,18 +138,21 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
             except Exception:
                 pass
 
+    # 3. Launch the engine orchestrator.
+    on_progress("Starting DM Daily Check engine (desktop v46)", percent=10)
+    cmd = _engine_command()
     t0 = time.time()
-    rc = _stream_subprocess([sys.executable, str(ENGINE_SCRIPT)], on_progress)
+    rc = _stream_subprocess(cmd, on_progress)
     elapsed = time.time() - t0
-
     on_progress(
         f"Engine exited with code {rc} after {elapsed:.0f}s",
         percent=85,
         level="info" if rc == 0 else "warning",
     )
 
-    # 3. Read every per-view JSON the engine wrote and upload rows.
-    on_progress("Uploading scraped rows to Supabase", percent=88)
+    # 4. Upload per-view JSONs to Supabase.
+    on_progress(f"Uploading scraped rows to Supabase (from {results_dir})",
+                percent=88)
     now_iso = datetime.now(timezone.utc).isoformat()
     total_uploaded = 0
 
@@ -162,7 +161,8 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
 
         if "_load_error" in payload:
             summary["views_failed"].append(
-                {"view": view_name, "reason": f"json-parse: {payload['_load_error']}"})
+                {"view": view_name,
+                 "reason": f"json-parse: {payload['_load_error']}"})
             summary["per_view"][view_name] = {"rows": 0, "skipped": True}
             on_progress(f"[{view_name}] couldn't read result JSON: "
                         f"{payload['_load_error']}", level="warning")
@@ -170,7 +170,6 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
 
         all_rows = payload.get("all_rows") or []
         view_uploaded = 0
-
         for idx, row in enumerate(all_rows):
             row_key = _row_key(view_name, idx, row)
             data = {

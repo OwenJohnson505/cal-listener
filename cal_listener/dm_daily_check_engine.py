@@ -171,6 +171,20 @@ except Exception as _cse:
 
 
 SCRIPT_DIR = Path(__file__).parent
+# When running inside a PyInstaller --onefile bundle, __file__ lives in a
+# random temp extract that vanishes when the process exits AND isn't shared
+# between sibling subprocesses. So redirect SCRIPT_DIR/HERE to a stable
+# %APPDATA%\CalListener\dm_workdir folder so:
+#   - the orchestrator and its per-view subprocesses see the same
+#     view_results directory,
+#   - the listener daemon that spawned the orchestrator can read those
+#     per-view JSONs after the engine exits.
+# (The temp extract is still used for loading dm_columns.py — see the
+#  Path(__file__).parent fallback in the v2 column resolver import above.)
+if getattr(sys, "frozen", False):
+    _appdata = Path(os.environ.get("APPDATA", str(Path.home())))
+    SCRIPT_DIR = _appdata / "CalListener" / "dm_workdir"
+    SCRIPT_DIR.mkdir(parents=True, exist_ok=True)
 # Outputs go to the parent folder when we're inside a 'scripts' subfolder;
 # otherwise we write next to ourselves (single-folder layout).
 HERE = (
@@ -2875,7 +2889,7 @@ def generate_eml(html_content):
 SCRIPT_VERSION = "v46 (deterministic column mapping from chooser display order — no OCR/heuristics needed)"
 
 
-VIEW_RESULTS_DIR = SCRIPT_DIR / "view_results"
+VIEW_RESULTS_DIR = HERE / "view_results"
 
 
 # ---------- Column chooser ("burger menu") control ----------

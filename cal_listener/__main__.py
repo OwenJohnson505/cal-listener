@@ -1,40 +1,53 @@
 """Run with: python -m cal_listener
 
-PyInstaller bundles this as the entry point, but at runtime the bundled
-script runs as ``__main__`` (no parent package), so we must import the
-daemon by absolute path — relative imports raise
-``ImportError: attempted relative import with no known parent package``.
+PyInstaller bundles this as the entry point. We use it as the dispatch
+table for three modes:
 
-Also routes a special sentinel arg `--engine-view <name>` back to the DM
-Daily Check engine. When PyInstaller-frozen, the engine can't subprocess
-its own .py file (it's inside a temp extraction folder); it re-launches
-the same .exe with this flag instead, and we dispatch here.
+  (default)            — start the long-running daemon (singleton checked).
+  --engine-orchestrate — run the DM Daily Check engine's orchestrator
+                         (spawns one --engine-view subprocess per filter
+                          view, combines results). Skips singleton.
+  --engine-view <name> — run ONE filter view of the engine, write its
+                         per-view JSON checkpoint, exit. Skips singleton.
+
+The two engine modes are how the daemon's dm_daily_check handler runs
+the bundled desktop scraper inside the frozen .exe. They MUST NOT take
+the singleton mutex — they are short-lived workers spawned by the
+daemon, which still holds the mutex.
 """
 import os
 import sys
 
 
-def _dispatch_engine_view():
-    """If called with `--engine-view <name>`, run that one view of the DM
-    Daily Check engine inline and exit. Returns True if dispatched."""
-    if "--engine-view" not in sys.argv:
-        return False
-    idx = sys.argv.index("--engine-view")
-    if idx + 1 >= len(sys.argv):
-        print("--engine-view requires a view name", flush=True)
-        sys.exit(2)
-    view_name = sys.argv[idx + 1]
+def _dispatch_engine_modes():
+    """Return True if we handled an engine sub-mode (and exited)."""
 
-    # Reshape argv so the engine's main() sees the original `--view <name>`
-    # path it expects, and import the engine to trigger module-level setup
-    # (gc.disable, faulthandler, DPI awareness, pywinauto import).
-    sys.argv = [sys.argv[0], "--view", view_name]
-    from cal_listener import dm_daily_check_engine as _engine  # noqa: F401
-    _engine.main()  # main() ends with os._exit(0); we won't return.
-    os._exit(0)
+    if "--engine-view" in sys.argv:
+        idx = sys.argv.index("--engine-view")
+        if idx + 1 >= len(sys.argv):
+            print("--engine-view requires a view name", flush=True)
+            sys.exit(2)
+        view_name = sys.argv[idx + 1]
+        # Reshape argv so the engine's main() sees its original `--view <name>`
+        # path. Importing the engine triggers module-level setup (gc.disable,
+        # faulthandler, DPI awareness, pywinauto import).
+        sys.argv = [sys.argv[0], "--view", view_name]
+        from cal_listener import dm_daily_check_engine as _engine
+        _engine.main()  # ends with os._exit(0); we won't return here.
+        os._exit(0)
+
+    if "--engine-orchestrate" in sys.argv:
+        # Run the engine's default orchestrator (its module-level main()
+        # with no flags spawns one subprocess per view, then combines).
+        sys.argv = [sys.argv[0]]
+        from cal_listener import dm_daily_check_engine as _engine
+        _engine.main()
+        os._exit(0)
+
+    return False
 
 
 if __name__ == "__main__":
-    if not _dispatch_engine_view():
+    if not _dispatch_engine_modes():
         from cal_listener.daemon import main
         main()
