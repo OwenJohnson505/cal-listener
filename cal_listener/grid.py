@@ -107,13 +107,93 @@ def _send_keys(keys: str) -> None:
     send_keys(keys)
 
 
+def _click_into_grid(main_window, on_progress=None) -> bool:
+    """Find any data cell inside the DM Telerik grid and click it so
+    that subsequent Ctrl+A lands on the grid (not on the filter-view
+    button we just clicked to get here).
+
+    Strategies tried in order:
+      1. Look for a DataGrid / Table control and click its first item.
+      2. Look for a control with class name containing 'GridView' or
+         'Telerik' and click an item inside it.
+      3. Find any DataItem / ListItem descendant and click it.
+      4. Find any Custom control whose name starts with a BT-ref pattern
+         (which is what DataItem rows expose in Telerik).
+    """
+    def _say(msg):
+        log.info("[grid-focus] %s", msg)
+        if on_progress:
+            try: on_progress(f"[grid-focus] {msg}")
+            except Exception: pass
+
+    main_window.set_focus()
+
+    # Strategy 1+2: find a grid-like container.
+    grid = None
+    for ct in ("DataGrid", "Table", "List"):
+        try:
+            for c in main_window.descendants(control_type=ct):
+                try:
+                    if c.is_visible():
+                        grid = c
+                        _say(f"found grid container: control_type={ct}")
+                        break
+                except Exception:
+                    continue
+            if grid: break
+        except Exception:
+            continue
+
+    if grid is None:
+        # Strategy 2b: by class name.
+        try:
+            for c in main_window.descendants():
+                try:
+                    cn = ""
+                    try: cn = c.element_info.class_name or ""
+                    except Exception: pass
+                    if cn and ("GridView" in cn or "RadGrid" in cn):
+                        if c.is_visible():
+                            grid = c
+                            _say(f"found grid by class_name: {cn}")
+                            break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    # Inside the grid (or the whole window if no grid container found),
+    # find a clickable row/cell.
+    search_root = grid or main_window
+    for ct in ("DataItem", "ListItem", "TreeItem", "Custom"):
+        try:
+            for item in search_root.descendants(control_type=ct):
+                try:
+                    if not item.is_visible():
+                        continue
+                    rect = item.rectangle()
+                    if rect.width() < 30 or rect.height() < 10:
+                        continue
+                    # Click the cell — gives the grid keyboard focus.
+                    item.click_input()
+                    _say(f"clicked into grid via {ct}: '{item.window_text()[:40]}'")
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    _say("no clickable data cell found — falling back to window focus")
+    return False
+
+
 def read_grid_via_clipboard(
     main_window,
     on_progress=None,
     attempts=((0.6, 6.0), (1.2, 10.0), (2.0, 15.0)),
     poll_interval=0.3,
 ) -> Optional[list[dict]]:
-    """Focus a cell in the main window, do Ctrl+A → Ctrl+C, return parsed
+    """Focus a cell inside the grid, do Ctrl+A → Ctrl+C, return parsed
     rows (or None on persistent failure).
 
     main_window: pywinauto window wrapper for DM's Cal (North) main window.
@@ -125,16 +205,17 @@ def read_grid_via_clipboard(
             try: on_progress(f"[grid] {msg}", **kw)
             except Exception: pass
 
-    # Find ANY data cell to click — gives keystrokes a target. The desktop
-    # uses _first_data_cell which scans for a specific Telerik DataItem;
-    # we keep it simpler: any visible Custom/Group control under the
-    # main window with reasonable size.
-    try:
-        # Try to set focus on the window so keystrokes land somewhere
-        # sensible even if we can't find a specific cell.
-        main_window.set_focus()
-    except Exception as e:
-        _say(f"set_focus failed: {e}")
+    # CRITICAL: give the GRID itself keyboard focus, not just the window.
+    # Ctrl+A goes to whatever has focus; if focus is on the filter-view
+    # button we just clicked to get here, Ctrl+A does nothing useful and
+    # the clipboard stays empty.
+    focused = _click_into_grid(main_window, on_progress=on_progress)
+    if not focused:
+        try:
+            main_window.set_focus()
+        except Exception as e:
+            _say(f"set_focus fallback failed: {e}")
+    time.sleep(0.3)
 
     text = ""
     for attempt_idx, (wait_a, wait_c) in enumerate(attempts, start=1):
