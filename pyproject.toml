@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cal-listener"
+version = "1.0.0"
+description = "Job-queue worker for Cal Toolkit Web — drives Delivery Master and ClearBooks from queued jobs."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Cal Sameday" }]
+license = { text = "Proprietary" }
+dependencies = [
+    "requests>=2.32",
+    # pywinauto + pywin32 are Windows-only — declared in optional group below
+    # so the package still installs in CI for type-checking on Linux.
+]
+
+[project.optional-dependencies]
+windows = [
+    "pywinauto>=0.6.8",
+    "pywin32>=306",
+    "psutil>=5.9",
+    "openpyxl>=3.1",
+]
+dev = [
+    "pyinstaller>=6.7",
+]
+
+[project.scripts]
+cal-listener = "cal_listener.daemon:main"
+
+[tool.setuptools.packages.find]
+include = ["cal_listener*"]
