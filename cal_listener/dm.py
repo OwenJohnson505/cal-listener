@@ -315,25 +315,104 @@ _KNOWN_PAGES = {
 }
 
 
-def click_left_nav(app, title: str) -> bool:
+# All the pywinauto control types we try when looking for a nav button.
+# DM uses a mix of TabItem (top ribbon tabs), Button (ribbon icons), and
+# sometimes ListItem / MenuItem (left rail). We try them in order.
+_NAV_CONTROL_TYPES = ("TabItem", "Button", "ListItem", "MenuItem", "Text")
+
+
+def click_nav_item(app, title: str,
+                   on_progress=None) -> tuple[bool, str]:
+    """Try increasingly aggressive strategies to find + click a nav
+    control with the given title. Returns (clicked?, strategy_used).
+
+    The strategies in order:
+      1. child_window(title=..., control_type=X)  for each X in _NAV_CONTROL_TYPES
+      2. descendants(control_type=X) + exact text match
+      3. descendants() across all control types + exact text match
+      4. descendants() + case-insensitive substring match
+    """
+    def _say(msg, **kw):
+        log.info("[nav] %s", msg)
+        if on_progress:
+            try: on_progress(f"[nav] {msg}", **kw)
+            except Exception: pass
+
     try:
         main = app.window(title_re=DM_TITLE_RE)
-        btn = main.child_window(title=title, control_type="Button")
-        if btn.exists(timeout=2):
-            btn.click_input()
-            return True
-        # Fallback: scan all buttons.
-        for b in main.descendants(control_type="Button"):
+    except Exception as e:
+        return (False, f"main-window-not-found: {e}")
+
+    # Strategy 1: targeted child_window per control type.
+    for ct in _NAV_CONTROL_TYPES:
+        try:
+            w = main.child_window(title=title, control_type=ct)
+            if w.exists(timeout=0.5):
+                _say(f"found {title!r} as {ct} via child_window")
+                try: w.click_input()
+                except Exception: w.invoke()
+                return (True, f"child_window:{ct}")
+        except Exception:
+            continue
+
+    # Strategy 2: descendants by control type, exact text.
+    for ct in _NAV_CONTROL_TYPES:
+        try:
+            for d in main.descendants(control_type=ct):
+                try:
+                    if (d.window_text() or "").strip() == title:
+                        _say(f"found {title!r} via descendants({ct})")
+                        try: d.click_input()
+                        except Exception: d.invoke()
+                        return (True, f"descendants:{ct}")
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    # Strategy 3: all descendants, exact text.
+    try:
+        for d in main.descendants():
             try:
-                if b.window_text() == title and b.is_visible():
-                    b.click_input()
-                    return True
+                if (d.window_text() or "").strip() == title:
+                    ct = ""
+                    try: ct = d.element_info.control_type
+                    except Exception: pass
+                    _say(f"found {title!r} as {ct} via all-descendants")
+                    try: d.click_input()
+                    except Exception: d.invoke()
+                    return (True, f"all-descendants:{ct}")
             except Exception:
                 continue
-        return False
     except Exception as e:
-        log.warning("click_left_nav %r failed: %s", title, e)
-        return False
+        return (False, f"descendants-failed: {e}")
+
+    # Strategy 4: case-insensitive substring fallback.
+    t_lower = title.lower()
+    try:
+        for d in main.descendants():
+            try:
+                w = (d.window_text() or "").lower()
+                if w == t_lower or w.startswith(t_lower):
+                    ct = ""
+                    try: ct = d.element_info.control_type
+                    except Exception: pass
+                    _say(f"found {title!r} (loose match {w!r}) as {ct}")
+                    try: d.click_input()
+                    except Exception: d.invoke()
+                    return (True, f"loose-match:{ct}")
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return (False, "not-found")
+
+
+# Back-compat shim (anything that used to call click_left_nav still works).
+def click_left_nav(app, title: str) -> bool:
+    ok, _ = click_nav_item(app, title)
+    return ok
 
 
 def ensure_on_page(app, page: str, on_progress=None) -> bool:
@@ -342,7 +421,36 @@ def ensure_on_page(app, page: str, on_progress=None) -> bool:
     if on_progress:
         try: on_progress(f"Navigating to {page}")
         except Exception: pass
-    return click_left_nav(app, page)
+    ok, _ = click_nav_item(app, page, on_progress=on_progress)
+    return ok
+
+
+def probe_nav_controls(app) -> list[dict]:
+    """Enumerate every clickable element with a non-empty title. Lets
+    a diagnostic handler dump the full nav surface to the result so we
+    can target real auto_ids next iteration."""
+    out: list[dict] = []
+    try:
+        main = app.window(title_re=DM_TITLE_RE)
+        for d in main.descendants():
+            try:
+                t = (d.window_text() or "").strip()
+                if not t:
+                    continue
+                ct = ""
+                try: ct = d.element_info.control_type
+                except Exception: pass
+                vis = False
+                try: vis = bool(d.is_visible())
+                except Exception: pass
+                if not vis:
+                    continue
+                out.append({"text": t, "control_type": ct})
+            except Exception:
+                continue
+    except Exception as e:
+        out.append({"error": str(e)})
+    return out
 
 
 # ---------------------------------------------------------------------------

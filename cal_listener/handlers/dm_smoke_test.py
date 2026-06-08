@@ -186,7 +186,44 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
     on_progress(
         f"Saw {visible_buttons} visible buttons. Sample titles: "
         f"{sample_button_texts}",
-        percent=95)
+        percent=88)
+
+    # Step 7 — probe the full nav surface (every clickable with a
+    # title) so we can target real auto_ids next iteration.
+    on_progress("Probing nav surface (all clickable controls)…", percent=90)
+    nav_controls = dm.probe_nav_controls(app)
+    diag["nav_controls_total"] = len(nav_controls)
+    # Group by control type for the result so it's actually readable.
+    by_type: Dict[str, list] = {}
+    for c in nav_controls:
+        ct = c.get("control_type", "?")
+        by_type.setdefault(ct, []).append(c.get("text"))
+    diag["nav_controls_by_type"] = {
+        k: sorted(set(v)) for k, v in by_type.items()
+    }
+    on_progress(
+        f"Found {len(nav_controls)} clickable controls across "
+        f"{len(by_type)} control types: "
+        f"{sorted(by_type.keys())}", percent=93)
+
+    # Step 8 — actually try to navigate. Always try "Booking" since the
+    # DM Daily Check journey starts there. params.target overrides.
+    nav_targets = params.get("nav_targets")
+    if not nav_targets:
+        nav_targets = ["Booking", "In Progress"]
+    nav_results = []
+    for label in nav_targets:
+        on_progress(f"Attempting to click nav: {label!r}", percent=95)
+        ok, strategy = dm.click_nav_item(app, label, on_progress=on_progress)
+        nav_results.append({
+            "target":   label,
+            "clicked":  ok,
+            "strategy": strategy,
+        })
+        on_progress(f"  → {label!r}: clicked={ok} strategy={strategy}",
+                    percent=96)
+        time.sleep(0.8)
+    diag["nav_attempts"] = nav_results
 
     on_progress("=== DM SMOKE TEST done ===", percent=100)
 
@@ -210,6 +247,21 @@ def _verdict(d: Dict[str, Any]) -> str:
                 "DM is probably running in the system tray / minimised. "
                 "We tried to force the window to the foreground; if you "
                 "still can't see it, the issue is at the OS level.")
+    nav = d.get("nav_attempts") or []
+    if nav and all(n.get("clicked") for n in nav):
+        return ("SUCCESS: DM running, visible, all navigation targets "
+                "clicked successfully. Foundation + navigation both work.")
+    if nav and any(n.get("clicked") for n in nav):
+        bad = [n["target"] for n in nav if not n["clicked"]]
+        return (f"PARTIAL: DM open and connected, navigation succeeded for "
+                f"some targets but failed for: {bad}. Check "
+                "nav_controls_by_type in this result for the actual control "
+                "names DM uses, then we can refine.")
+    if nav and not any(n.get("clicked") for n in nav):
+        return ("CONNECTED but NAVIGATION FAILED for every target. The DM "
+                "main window is open but click_nav_item couldn't find the "
+                "labels. Look at nav_controls_by_type to see what DM "
+                "actually exposes.")
     if d.get("visible_button_count", 0) > 0 and d.get("foreground_title"):
         return ("SUCCESS: DM is running, visible, and we successfully "
                 f"connected + enumerated controls. Foreground title: "
