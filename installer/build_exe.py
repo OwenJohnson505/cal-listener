@@ -39,8 +39,19 @@ def main():
         "--noconfirm",
         "--onefile",
         "--name", "CalListener",
-        "--windowed",                      # no console window
-        "--collect-all", "cal_listener",   # bundle all submodules
+        "--windowed",                          # no console window
+        "--collect-all", "cal_listener",       # bundle all submodules
+        # pywinauto + pywin32 do TONS of dynamic submodule loading.
+        # --collect-all on each pulls the whole tree, which is the
+        # only reliable way to make them work after PyInstaller bundling.
+        "--collect-all", "pywinauto",
+        "--collect-all", "comtypes",
+        "--hidden-import", "psutil",
+        "--hidden-import", "win32api",
+        "--hidden-import", "win32con",
+        "--hidden-import", "win32gui",
+        "--hidden-import", "win32process",
+        "--hidden-import", "pythoncom",
         "--icon", "NONE",
         str(ROOT / "cal_listener" / "__main__.py"),
     ]
