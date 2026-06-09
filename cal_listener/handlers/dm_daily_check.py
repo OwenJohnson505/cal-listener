@@ -77,6 +77,49 @@ def _company_from_ctx(ctx) -> str:
     return val.lower()
 
 
+def _clean(s) -> str:
+    """Strip DM's junk trailing characters from text fields.
+    DM sometimes appends ¬ or ¶ to customer/cust_ref values that look
+    cosmetic but pollute Supabase rows. Stripping in the listener
+    keeps the web table clean without touching the engine."""
+    if s is None:
+        return ""
+    return str(s).rstrip(" ¬¶\t").strip()
+
+
+def _fetch_decision_history(ctx, company: str, on_progress) -> dict:
+    """Pull the user's prior decisions for `company` from
+    `dm_daily_decision_history`. Returns a dict keyed by `our_ref`
+    with the row's `last_decision` ('accepted' / 'not_accepted').
+
+    The listener uses this to OVERLAY user decisions back onto the
+    scraped data — so if a user moved a row from Not Accepted to
+    Accepted on the web, the next scrape preserves that classification
+    instead of resetting it from the rule-engine's default.
+    """
+    target = (company or "").lower()
+    PAGE = 1000
+    out: dict[str, str] = {}
+    for offset in range(0, 50_000, PAGE):
+        rows = ctx.sb.get(
+            f"shared_rows?dataset=eq.dm_daily_decision_history"
+            f"&select=data&limit={PAGE}&offset={offset}"
+        )
+        if not isinstance(rows, list) or not rows:
+            break
+        for r in rows:
+            d = r.get("data") or {}
+            if (d.get("company") or "").lower() != target:
+                continue
+            ref = (d.get("our_ref") or "").strip()
+            decision = d.get("last_decision")
+            if ref and decision:
+                out[ref] = decision
+        if len(rows) < PAGE:
+            break
+    return out
+
+
 def _fetch_customer_names(ctx, company: str, on_progress) -> list[str]:
     """Pull the TMS customer name list for `company` from Supabase
     (dataset `customer_profiles`). The desktop's `invoice_store` does
@@ -248,6 +291,23 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
     now_iso = datetime.now(timezone.utc).isoformat()
     on_progress(f"Using company={company!r} for row_key namespacing",
                 level="info")
+
+    # 4a. Load user decisions so we can preserve them on this re-scrape.
+    # Without this overlay, every scrape resets categorisation from the
+    # rule engine's default, undoing any manual moves the user made on
+    # the web (Save review / bulk move-to-tab).
+    try:
+        history_map = _fetch_decision_history(ctx, company, on_progress)
+        on_progress(
+            f"Loaded {len(history_map)} prior user decisions for overlay",
+            level="info",
+        )
+    except Exception as e:
+        history_map = {}
+        on_progress(f"Couldn't load decision history: {e} — proceeding "
+                    "with rule defaults (user moves WILL be reset by "
+                    "this scrape)", level="warning")
+
     total_uploaded = 0
 
     for view_slug, payload in _read_view_results(results_dir):
@@ -274,27 +334,33 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
 
         def _build(row, default_decision):
             our_ref = (row.get("our_ref") or "").strip()
+            # If the user has decided on this row before, that wins
+            # over the rule engine's default. Tracked in the
+            # `decision_source` field so the UI can distinguish
+            # rule-based defaults from preserved user choices.
+            user_decision = history_map.get(our_ref) if our_ref else None
+            effective = user_decision or default_decision
             data = {
                 "view":              view_name,
                 "company":           company,
                 "our_ref":           our_ref,
                 # Alias `ref` for the web app's Reference column —
-                # DMDailyCheck.tsx reads `d.ref || d.bt_ref`. The desktop
-                # uses `our_ref`; this just mirrors it so both readers
-                # see the BT-number.
+                # DMDailyCheck.tsx reads `d.ref || d.bt_ref`.
                 "ref":               our_ref,
-                "cust_ref":          row.get("cust_ref") or "",
-                "customer":          row.get("customer") or "",
+                "cust_ref":          _clean(row.get("cust_ref")),
+                "customer":          _clean(row.get("customer")),
                 "status":            row.get("status") or "",
                 "del_date":          row.get("del_date") or "",
                 "reasons":           row.get("reasons") or "",
+                # The rule engine's default classification, kept so
+                # the web can tell what would have happened without
+                # user input.
                 "_default_decision": default_decision,
-                # Alias `tab` so the web's classifyTab(d) function picks
-                # the right bucket. It reads `d.tab || d.status`, and DM
-                # status values ("Complete", "POD", "Waiting", etc.)
-                # never contain "accept" or "eligible", so without this
-                # alias every row falls through to the not_accepted tab.
-                "tab":               default_decision,
+                # The effective tab — user decision if it exists,
+                # otherwise the rule default. This is what classifyTab
+                # reads on the web.
+                "tab":               effective,
+                "decision_source":   "user" if user_decision else "rules",
                 "scraped_at":        now_iso,
                 "scraped_by":        ctx.settings.listener_id,
             }
