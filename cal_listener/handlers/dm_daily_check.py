@@ -123,8 +123,27 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
     # 1. Make sure DM is running + logged in. The engine's find_dm() will
     # then attach to the same process.
     on_progress("Ensuring DM is logged in and ready", percent=5)
-    dm.ensure_logged_in(ctx, on_progress=on_progress, timeout=120)
+    app = dm.ensure_logged_in(ctx, on_progress=on_progress, timeout=120)
     time.sleep(1.0)
+
+    # 1b. Navigate DM to the Booking tab. The desktop engine's
+    # switch_view(view) only clicks the filter button (In Progress,
+    # Katie, etc.) — those buttons are children of the Booking page.
+    # On the desktop, the user is already on Booking when they run DM
+    # Daily Check; on the listener we land on Home after login, so we
+    # must navigate explicitly or the engine fails with "Couldn't find
+    # button 'In Progress'".
+    on_progress("Navigating to Booking tab", percent=7)
+    ok, strategy = dm.click_nav_item(app, "Booking", on_progress=on_progress)
+    if not ok:
+        return {
+            "ok": False,
+            "error": f"could not click 'Booking' tab (strategy={strategy})",
+            "summary": summary,
+        }
+    # Give the Booking page a moment to render its filter buttons before
+    # we hand DM over to the engine subprocess.
+    time.sleep(1.5)
 
     # 2. Resolve workdir + clear stale per-view JSONs.
     workdir = _engine_workdir()
