@@ -60,4 +60,5 @@ HANDLERS: Dict[str, Callable] = {
     # ----- Diagnostic -------------------------------------------------------
     "ping":          _lazy("cal_listener.handlers.ping"),
     "dm_smoke_test": _lazy("cal_listener.handlers.dm_smoke_test"),
+    "dm_probe_nav":  _lazy("cal_listener.handlers.dm_probe_nav"),
 }

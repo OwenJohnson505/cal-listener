@@ -59,10 +59,33 @@ def _build_xlsx(rows: List[dict]) -> bytes:
 def run(params: Dict[str, Any], on_progress: Callable[..., None], ctx) -> Dict[str, Any]:
     max_rows = int(params.get("max_rows") or 50)
 
+    import time
     on_progress("Ensuring DM is logged in", percent=5)
     app = dm.ensure_logged_in(ctx, on_progress=on_progress, timeout=120)
-    on_progress("Navigating to Invoicing", percent=10)
-    dm.navigate_to_page(app, "Invoicing", on_progress=on_progress)
+
+    # DM nav path: Home -> Booking tab -> Customer Invoice. The
+    # engine verifies it's on a window titled "Cal (...) : Customer
+    # Invoice", so we MUST do both clicks. The single "Invoicing"
+    # click in v1.4.0 / v1.4.1 only hit a home-screen shortcut tile
+    # that doesn't actually navigate.
+    on_progress("Step 1: click 'Booking' tab", percent=8)
+    ok1, strat1 = dm.click_nav_item(app, "Booking", on_progress=on_progress)
+    if not ok1:
+        return {"ok": False,
+                "error": f"could not click 'Booking' tab (strategy={strat1})",
+                "record_count": 0}
+    time.sleep(1.2)
+    on_progress("Step 2: click 'Customer Invoice'", percent=11)
+    ok2, strat2 = dm.click_nav_item(
+        app, "Customer Invoice", on_progress=on_progress)
+    if not ok2:
+        return {"ok": False,
+                "error": (f"could not click 'Customer Invoice' "
+                          f"(strategy={strat2}). Run dm_probe_nav with "
+                          f"params {{\"page\": \"Booking\"}} to see what's "
+                          f"actually on the Booking page."),
+                "record_count": 0}
+    time.sleep(1.2)
 
     _setup_engine_imports()
     from cal_listener import revenue_breakdown_driver as _drv
