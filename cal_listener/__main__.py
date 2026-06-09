@@ -19,8 +19,17 @@ import os
 import sys
 
 
+_VERSION = "1.3.3"
+
+
 def _dispatch_engine_modes():
     """Return True if we handled an engine sub-mode (and exited)."""
+
+    # Print version banner so we can tell from any log which build is
+    # actually running. Visible in BOTH daemon mode and engine-dispatch
+    # mode — i.e. always.
+    print(f"[cal_listener] v{_VERSION} starting; argv={sys.argv!r}",
+          flush=True)
 
     if "--engine-view" in sys.argv:
         idx = sys.argv.index("--engine-view")

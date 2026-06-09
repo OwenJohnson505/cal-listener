@@ -3803,41 +3803,49 @@ def _process_one_view_subprocess(view_name, no_clipboard=False):
             extra["creationflags"] = subprocess.CREATE_NO_WINDOW
         except AttributeError:
             pass
+    # LIVE-STREAM the subprocess output instead of buffering with
+    # capture_output. Buffering meant each view ran silently for 10-30s
+    # then dumped its full output in one go AFTER exiting — which made
+    # the orchestrator look frozen and hid early-import crashes until
+    # after the (potentially silent) crash. With Popen + line-iteration
+    # we see exactly what's happening as it happens. We still preserve
+    # the full transcript so a native crash that loses output before
+    # the pipe drains has at least the captured lines.
+    transcript: list = []
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            timeout=300,
-            check=False,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
+            bufsize=1,
             encoding="utf-8",
             errors="replace",
             env=env,
             **extra,
         )
-        # Echo whatever the child managed to print, prefixed for clarity.
-        if result.stdout:
-            for line in result.stdout.splitlines():
+        deadline = time.time() + 300
+        assert proc.stdout is not None
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                # EOF — child closed stdout (either exited or crashed).
+                break
+            line = line.rstrip()
+            if line:
                 print(f"    {line}", flush=True)
-        if result.stderr:
-            for line in result.stderr.splitlines():
-                print(f"    [stderr] {line}", flush=True)
-        if not (result.stdout or result.stderr):
+                transcript.append(line)
+            if time.time() > deadline:
+                proc.kill()
+                print(f"  !!! subprocess timed out after 300s", flush=True)
+                return -1
+        rc = proc.wait(timeout=10)
+        if not transcript:
             print(f"    (subprocess produced NO output before exiting "
-                  f"with code {result.returncode} - probable native crash "
-                  f"in module-level import / pywinauto init)", flush=True)
-        return result.returncode
-    except subprocess.TimeoutExpired as e:
-        # Echo any partial output the process managed to emit before
-        # timing out.
-        if e.stdout:
-            try:
-                txt = e.stdout if isinstance(e.stdout, str) else \
-                    e.stdout.decode("utf-8", errors="replace")
-                for line in txt.splitlines():
-                    print(f"    {line}", flush=True)
-            except Exception:
-                pass
+                  f"with code {rc} - probable native crash in module-level "
+                  f"import / pywinauto init)", flush=True)
+        return rc
+    except subprocess.TimeoutExpired:
         print(f"  !!! subprocess timed out after 300s", flush=True)
         return -1
     except Exception as e:
