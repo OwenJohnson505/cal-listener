@@ -465,3 +465,17 @@ def ensure_ready(ctx, target_page: Optional[str] = None,
     if target_page:
         ensure_on_page(app, target_page, on_progress=on_progress)
     return app
+
+
+def navigate_to_page(app, page: str,
+                     on_progress: Optional[Callable[..., None]] = None) -> bool:
+    """Public alias for ensure_on_page. Used by handlers that need to
+    land on a specific top-level DM page (Customers, Invoicing, etc.)
+    before handing off to a plugin engine.
+
+    Most listener-side engines (dm_docket_search, tariff_retrigger,
+    revenue_breakdown) open their own DM dialogs from the main window,
+    so the page just has to be reachable — exact landing tab usually
+    doesn't matter, but Customers-page-scoped plugins like
+    customer_email_audit do need this to land on Customers first."""
+    return ensure_on_page(app, page, on_progress=on_progress)
