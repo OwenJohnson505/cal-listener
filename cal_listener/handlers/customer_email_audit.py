@@ -11,11 +11,12 @@ params:
 """
 from __future__ import annotations
 
+import io
 import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, List
 
 import requests
 
@@ -41,7 +42,66 @@ def _download_input(ctx, storage_path: str, dest: Path) -> None:
     dest.write_bytes(r.content)
 
 
-def run(params: Dict[str, Any], on_progress: Callable[..., None], ctx) -> Dict[str, Any]:
+def _build_xlsx(records: List[dict], summary: dict) -> bytes:
+    """3-sheet xlsx (All / Mismatches / Summary), same shape as desktop."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    wb = Workbook()
+    ws_all = wb.active
+    ws_all.title = "All Records"
+    headers = ["TMS Customer", "DM Invoice Email",
+               "DM Additional Emails", "DM Notes Emails",
+               "ClearBooks Name", "ClearBooks Email",
+               "Match Status", "Detail"]
+    ws_all.append(headers)
+    for c in ws_all[1]:
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = PatternFill("solid", fgColor="0EA5A4")
+        c.alignment = Alignment(horizontal="left", vertical="center")
+    for rec in records:
+        ws_all.append([
+            rec.get("trading", ""),
+            rec.get("invoice", ""),
+            rec.get("additional_emails", ""),
+            ", ".join(rec.get("notes_emails", []) or []),
+            rec.get("cb_name", ""),
+            rec.get("cb_email", ""),
+            rec.get("status", ""),
+            rec.get("detail", ""),
+        ])
+
+    ws_mm = wb.create_sheet("Mismatches")
+    ws_mm.append(headers)
+    for c in ws_mm[1]:
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = PatternFill("solid", fgColor="DC2626")
+    for rec in records:
+        if rec.get("status") == "mismatched":
+            ws_mm.append([
+                rec.get("trading", ""), rec.get("invoice", ""),
+                rec.get("additional_emails", ""),
+                ", ".join(rec.get("notes_emails", []) or []),
+                rec.get("cb_name", ""), rec.get("cb_email", ""),
+                rec.get("status", ""), rec.get("detail", "")])
+
+    ws_sum = wb.create_sheet("Summary")
+    for k, v in (summary or {}).items():
+        ws_sum.append([k, v])
+    for c in ws_sum["A"]:
+        c.font = Font(bold=True)
+
+    for ws in (ws_all, ws_mm):
+        for col in ws.columns:
+            ws.column_dimensions[col[0].column_letter].width = 28
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def run(params: Dict[str, Any], on_progress: Callable[..., None],
+        ctx) -> Dict[str, Any]:
     cb_path = params.get("cb_csv_storage_path")
     if not cb_path:
         return {"ok": False, "error": "cb_csv_storage_path required",
@@ -62,36 +122,58 @@ def run(params: Dict[str, Any], on_progress: Callable[..., None], ctx) -> Dict[s
 
     limit = params.get("limit")
     if limit is not None:
-        try: limit = int(limit)
-        except Exception: limit = None
+        try:
+            limit = int(limit)
+        except Exception:
+            limit = None
+
+    records: List[dict] = []
+
+    def _on_record(rec: dict) -> None:
+        records.append(rec)
+
+    def _on_engine_progress(done: int, total: int, msg: str) -> None:
+        pct = 15 + int(75 * (done / max(total, 1)))
+        on_progress(f"{msg} ({done}/{total})",
+                    percent=min(pct, 90))
+
+    def _stop_check() -> bool:
+        # Cancellation propagates via on_progress raising JobCancelled
+        # on the next call from the runner; engine doesn't poll this
+        # often enough to be the primary path.
+        return False
 
     on_progress("Running audit (walking every customer)", percent=15)
-    # The engine's run_audit signature (best-effort — adjust if first
-    # run reports a wrong arg name).
-    result = _engine.run_audit(
-        cb_csv_path=str(local_csv),
-        on_progress=lambda msg, pct=None, **kw: on_progress(
-            msg, percent=(pct if pct is not None else None)),
+    summary = _engine.run_audit(
+        csv_path=local_csv,
+        on_record=_on_record,
+        on_progress=_on_engine_progress,
+        stop_check=_stop_check,
+        logger=lambda m: on_progress(m, percent=None),
         limit=limit,
-    ) if hasattr(_engine, "run_audit") else None
+    )
 
-    if not result or not result.get("xlsx_path"):
-        return {"ok": False,
-                "error": "engine.run_audit did not produce xlsx_path",
-                "summary": result or {}}
+    on_progress(
+        f"Engine finished: {summary.get('processed')} processed, "
+        f"{summary.get('mismatched')} mismatched", percent=92)
 
-    xlsx_bytes = Path(result["xlsx_path"]).read_bytes()
+    on_progress("Building Excel output", percent=94)
+    xlsx_bytes = _build_xlsx(records, summary)
+
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     key = f"customer_email_audit/customer_email_audit_{stamp}.xlsx"
+    on_progress(f"Uploading {key}", percent=97)
     ok = ctx.sb.storage_upload(
         "listener_results", key, xlsx_bytes,
-        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    public_url = ctx.sb.storage_public_url("listener_results", key) if ok else None
+        content_type=("application/vnd.openxmlformats-"
+                      "officedocument.spreadsheetml.sheet"))
+    public_url = (ctx.sb.storage_public_url("listener_results", key)
+                  if ok else None)
 
     on_progress("Done", percent=100)
     return {
         "ok": True,
-        "record_count": result.get("total_rows") or 0,
+        "record_count": len(records),
         "result_url": public_url,
-        "summary": result.get("summary") or {},
+        "summary": summary or {},
     }
