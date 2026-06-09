@@ -48,6 +48,10 @@ HANDLERS: Dict[str, Callable] = {
     "tariff_retrigger_dry_run":  _lazy("cal_listener.handlers.tariff_retrigger_dry_run"),
     "tariff_assigner":           _lazy("cal_listener.handlers.tariff_assigner"),
     "dm_daily_check":            _lazy("cal_listener.handlers.dm_daily_check"),
+
+    # ----- File-processor reports (no DM, no browser) ----------------------
+    "bookings_report":           _lazy("cal_listener.handlers.bookings_report"),
+    "maersk_report":             _lazy("cal_listener.handlers.maersk_report"),
     "invoice_plan_run":          _lazy("cal_listener.handlers.invoice_plan_run"),
 
     # ----- ClearBooks-driven (browser automation) --------------------------
