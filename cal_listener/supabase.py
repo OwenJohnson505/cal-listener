@@ -33,6 +33,36 @@ class Supabase:
         )
         self._check(r, "upsert", table)
 
+    def bulk_upsert(self, table: str, rows: list, chunk_size: int = 200,
+                    progress=None) -> int:
+        """Upsert many rows in chunked POSTs. PostgREST accepts a JSON
+        array natively, so each chunk is one HTTPS round-trip instead of
+        N. Default chunk is 200 rows which keeps each body well under
+        PostgREST's 1 MB default limit. Returns count of rows accepted
+        (request count, not server-side row count).
+
+        If `progress` is a callable, it's invoked after each chunk with
+        (rows_done, rows_total) so the caller can stream feedback to
+        the user."""
+        if not rows:
+            return 0
+        total = len(rows)
+        sent = 0
+        for i in range(0, total, chunk_size):
+            chunk = rows[i:i + chunk_size]
+            r = requests.post(
+                f"{self.url}/rest/v1/{table}",
+                headers={**self._h,
+                         "Prefer": "resolution=merge-duplicates,return=minimal"},
+                json=chunk, timeout=60,
+            )
+            self._check(r, "bulk_upsert", table)
+            sent += len(chunk)
+            if progress is not None:
+                try: progress(sent, total)
+                except Exception: pass
+        return sent
+
     def insert(self, table: str, row: Dict[str, Any]) -> None:
         r = requests.post(
             f"{self.url}/rest/v1/{table}",

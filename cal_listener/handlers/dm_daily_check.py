@@ -188,7 +188,10 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
             continue
 
         all_rows = payload.get("all_rows") or []
-        view_uploaded = 0
+        # Build the full upsert batch first, then push in chunked POSTs.
+        # Previous one-row-per-request approach took ~25 minutes for a
+        # 1475-row scrape; bulk upsert turns it into ~8 requests total.
+        batch = []
         for idx, row in enumerate(all_rows):
             row_key = _row_key(view_name, idx, row)
             data = {
@@ -198,16 +201,27 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
                 "row_index":    idx,
                 **row,
             }
-            try:
-                ctx.sb.upsert("shared_rows", {
-                    "dataset": "dm_daily_check",
-                    "row_key": row_key,
-                    "data":    data,
-                })
-                view_uploaded += 1
-            except Exception as e:
-                on_progress(f"[{view_name}] upload row {idx} failed: {e}",
-                            level="warning")
+            batch.append({
+                "dataset": "dm_daily_check",
+                "row_key": row_key,
+                "data":    data,
+            })
+
+        def _on_chunk(sent, total):
+            on_progress(
+                f"[{view_name}] uploaded {sent}/{total} rows",
+                level="info",
+            )
+
+        view_uploaded = 0
+        try:
+            view_uploaded = ctx.sb.bulk_upsert(
+                "shared_rows", batch, chunk_size=200,
+                progress=_on_chunk,
+            )
+        except Exception as e:
+            on_progress(f"[{view_name}] bulk upload failed: {e}",
+                        level="warning")
 
         total_uploaded += view_uploaded
         summary["views_succeeded"].append(view_name)
