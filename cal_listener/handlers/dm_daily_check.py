@@ -213,12 +213,23 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
                 "view":              view_name,
                 "company":           company,
                 "our_ref":           our_ref,
+                # Alias `ref` for the web app's Reference column —
+                # DMDailyCheck.tsx reads `d.ref || d.bt_ref`. The desktop
+                # uses `our_ref`; this just mirrors it so both readers
+                # see the BT-number.
+                "ref":               our_ref,
                 "cust_ref":          row.get("cust_ref") or "",
                 "customer":          row.get("customer") or "",
                 "status":            row.get("status") or "",
                 "del_date":          row.get("del_date") or "",
                 "reasons":           row.get("reasons") or "",
                 "_default_decision": default_decision,
+                # Alias `tab` so the web's classifyTab(d) function picks
+                # the right bucket. It reads `d.tab || d.status`, and DM
+                # status values ("Complete", "POD", "Waiting", etc.)
+                # never contain "accept" or "eligible", so without this
+                # alias every row falls through to the not_accepted tab.
+                "tab":               default_decision,
                 "scraped_at":        now_iso,
                 "scraped_by":        ctx.settings.listener_id,
             }
