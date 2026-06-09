@@ -106,8 +106,10 @@ def _main_title(app) -> str:
 
 
 def _enumerate(app) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, int]]]:
-    """Return (controls, main_rect). controls = every visible labelled
-    descendant. main_rect lets us bucket controls by edge later."""
+    """Return (controls, main_rect). Captures every visible descendant —
+    including ones with NO visible text — pulling tooltip / legacy
+    accessible name / automation_id so we can identify icon-only
+    nav buttons (e.g. DM's left RadNavigationView strip)."""
     out: List[Dict[str, Any]] = []
     main_rect: Optional[Dict[str, int]] = None
     try:
@@ -123,6 +125,15 @@ def _enumerate(app) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, int]]]:
     except Exception as e:
         return ([{"error": f"descendants-failed: {e}"}], main_rect)
 
+    # Pre-compute edge bands so we know which controls are in the
+    # left strip — we capture empty-text controls only when they're
+    # in a strip (otherwise we'd flood with thousands of irrelevant
+    # internal Telerik panels).
+    LEFT_BAND = 80
+    BOTTOM_BAND = 80
+    main_left = main_rect["left"]
+    main_bottom = main_rect["bottom"]
+
     for d in descendants:
         try:
             if not d.is_visible():
@@ -133,8 +144,6 @@ def _enumerate(app) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, int]]]:
             text = (d.window_text() or "").strip()
         except Exception:
             text = ""
-        if not text:
-            continue
 
         rec: Dict[str, Any] = {"text": text}
         try:
@@ -149,9 +158,13 @@ def _enumerate(app) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, int]]]:
             rr = d.rectangle()
             rec["rect"] = [rr.left, rr.top, rr.right, rr.bottom]
             rec["size"] = [rr.right - rr.left, rr.bottom - rr.top]
+            in_left_strip = (rr.left - main_left) < LEFT_BAND
+            in_bottom_strip = (main_bottom - rr.bottom) < BOTTOM_BAND
         except Exception:
             rec["rect"] = None
             rec["size"] = None
+            in_left_strip = False
+            in_bottom_strip = False
         try:
             p = d.parent()
             if p is not None:
@@ -161,6 +174,46 @@ def _enumerate(app) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, int]]]:
         except Exception:
             rec["parent_text"] = ""
             rec["parent_control_type"] = ""
+
+        # For empty-text controls: only keep them if they're in a
+        # strip (left or bottom) AND they're a button-shaped control.
+        # Pull tooltip / accessible name / class via legacy_properties.
+        if not text:
+            if not (in_left_strip or in_bottom_strip):
+                continue
+            ct = rec.get("control_type", "")
+            if ct not in ("Button", "ListItem", "TabItem", "MenuItem",
+                          "Custom", "Hyperlink", "Image", "Pane"):
+                continue
+            # Try multiple ways to get a label for this iconic control.
+            label_sources: Dict[str, str] = {}
+            try:
+                legacy = d.legacy_properties() or {}
+                for k in ("Name", "Value", "Description",
+                          "DefaultAction", "Help"):
+                    v = legacy.get(k)
+                    if v:
+                        label_sources[f"legacy_{k.lower()}"] = str(v)
+            except Exception:
+                pass
+            try:
+                ei = d.element_info
+                for attr in ("rich_text", "name"):
+                    if hasattr(ei, attr):
+                        v = getattr(ei, attr)
+                        if v:
+                            label_sources[f"ei_{attr}"] = str(v)
+            except Exception:
+                pass
+            try:
+                cls = d.element_info.class_name or ""
+                if cls:
+                    label_sources["class_name"] = cls
+            except Exception:
+                pass
+            rec["label_sources"] = label_sources
+            rec["in_strip"] = ("left" if in_left_strip
+                               else ("bottom" if in_bottom_strip else ""))
 
         out.append(rec)
     return out, main_rect
@@ -310,6 +363,29 @@ def run(params: Dict[str, Any], on_progress: Callable[..., None],
                 f"    - {ic['text']!r}  ({ic['control_type']})  "
                 f"auto_id={ic['auto_id']!r}  parent={ic['parent_text']!r}",
                 level="info")
+
+        # Show left-strip icon controls (no text but legacy name set —
+        # this is how Customers / Drivers / etc are reached).
+        left_icons = [c for c in controls
+                      if c.get("in_strip") == "left"
+                      and not c.get("text")
+                      and c.get("label_sources")]
+        if left_icons:
+            on_progress(
+                f"  Left-strip icon controls ({len(left_icons)}):",
+                level="info")
+            for c in left_icons[:30]:
+                ls = c.get("label_sources") or {}
+                label = (ls.get("legacy_name") or ls.get("legacy_help")
+                         or ls.get("legacy_description")
+                         or ls.get("ei_name") or "?")
+                on_progress(
+                    f"    - [{c['control_type']:10s}] "
+                    f"label={label!r:30s}  "
+                    f"auto_id={c.get('auto_id', '')!r}  "
+                    f"class={ls.get('class_name', '')!r}  "
+                    f"rect={c.get('rect')}",
+                    level="info")
         if verbose:
             for c in controls[:80]:
                 on_progress(
