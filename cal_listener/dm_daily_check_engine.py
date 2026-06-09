@@ -164,6 +164,13 @@ except Exception:
             "dm_columns", str(Path(__file__).parent / "dm_columns.py"))
         _mod = _ilu.module_from_spec(_spec)
         _spec.loader.exec_module(_mod)  # type: ignore
+        # CRITICAL: register the loaded module in sys.modules so later
+        # `from dm_columns import X` calls (e.g. in
+        # _load_tms_customer_names's sidecar path) succeed. Without this
+        # the module exists as a local but the import machinery can't
+        # find it and we fall back to content heuristics — which then
+        # gets Customer / Cust. Ref backwards on tricky views.
+        sys.modules["dm_columns"] = _mod
         _resolve_columns_v2 = _mod.resolve_columns
         _header_map_from_labels = _mod.header_map_from_labels
         _canonical_from_header_v2 = _mod.canonical_from_header
