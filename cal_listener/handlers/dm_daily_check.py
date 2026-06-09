@@ -59,15 +59,22 @@ def _engine_command():
     return [sys.executable, "-u", str(ENGINE_SCRIPT)]
 
 
-def _row_key(view: str, idx: int, row: dict) -> str:
-    """Stable key per (view, ref-or-fallback). Lets repeat scrapes
-    overwrite the same row instead of duplicating."""
-    ref = row.get("ref") or row.get("Ref") or ""
-    if isinstance(ref, str) and ref.startswith("BT") and len(ref) <= 12:
-        return f"{view.replace(' ', '_').lower()}-{ref}"
-    raw = json.dumps(row, sort_keys=True, default=str)
-    return (f"{view.replace(' ', '_').lower()}-row-{idx:04d}-"
-            f"{hashlib.sha1(raw.encode()).hexdigest()[:8]}")
+def _row_key(company: str, view: str, our_ref: str) -> str:
+    """Row key used by the desktop store (and therefore the web app).
+    Format MUST match `dm_daily_store._row_key()` exactly so a listener
+    scrape overwrites the same rows as a desktop scrape would, and the
+    web app finds rows under the keys it expects."""
+    return f"{(company or '').lower()}:{view}:{(our_ref or '').strip()}"
+
+
+# Default company. The desktop tracks current company in user state;
+# the listener doesn't have a UI to choose, so we use the value from
+# the listener settings (env CAL_DM_COMPANY) or default to 'north'.
+# Matches the engine's _load_tms_customer_names() fallback.
+def _company_from_ctx(ctx) -> str:
+    val = os.environ.get("CAL_DM_COMPANY") or getattr(
+        ctx.settings, "dm_company", "") or "north"
+    return val.lower()
 
 
 def _stream_subprocess(cmd, on_progress):
@@ -173,6 +180,9 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
     on_progress(f"Uploading scraped rows to Supabase (from {results_dir})",
                 percent=88)
     now_iso = datetime.now(timezone.utc).isoformat()
+    company = _company_from_ctx(ctx)
+    on_progress(f"Using company={company!r} for row_key namespacing",
+                level="info")
     total_uploaded = 0
 
     for view_slug, payload in _read_view_results(results_dir):
@@ -187,25 +197,47 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
                         f"{payload['_load_error']}", level="warning")
             continue
 
-        all_rows = payload.get("all_rows") or []
-        # Build the full upsert batch first, then push in chunked POSTs.
-        # Previous one-row-per-request approach took ~25 minutes for a
-        # 1475-row scrape; bulk upsert turns it into ~8 requests total.
-        batch = []
-        for idx, row in enumerate(all_rows):
-            row_key = _row_key(view_name, idx, row)
+        # Read the engine's categorised buckets (flagged / accepted /
+        # not_eligible), NOT the raw positional all_rows. Each bucket
+        # entry already has named fields (our_ref, cust_ref, customer,
+        # status, del_date, reasons) — exactly what the web app's table
+        # expects. The desktop writes the same shape to shared_rows.
+        flagged       = payload.get("flagged") or []
+        accepted_lst  = payload.get("accepted") or []
+        not_eligible  = payload.get("not_eligible") or []
+        engine_total  = len(flagged) + len(accepted_lst) + len(not_eligible)
+
+        def _build(row, default_decision):
+            our_ref = (row.get("our_ref") or "").strip()
             data = {
-                "view":         view_name,
-                "scraped_at":   now_iso,
-                "scraped_by":   ctx.settings.listener_id,
-                "row_index":    idx,
-                **row,
+                "view":              view_name,
+                "company":           company,
+                "our_ref":           our_ref,
+                "cust_ref":          row.get("cust_ref") or "",
+                "customer":          row.get("customer") or "",
+                "status":            row.get("status") or "",
+                "del_date":          row.get("del_date") or "",
+                "reasons":           row.get("reasons") or "",
+                "_default_decision": default_decision,
+                "scraped_at":        now_iso,
+                "scraped_by":        ctx.settings.listener_id,
             }
-            batch.append({
+            return {
                 "dataset": "dm_daily_check",
-                "row_key": row_key,
+                "row_key": _row_key(company, view_name, our_ref),
                 "data":    data,
-            })
+            }
+
+        batch = (
+            [_build(r, "not_accepted") for r in flagged]
+            + [_build(r, "accepted") for r in accepted_lst]
+            + [_build(r, "not_eligible") for r in not_eligible]
+        )
+        # Drop any rows with empty our_ref — they'd all collide on the
+        # same row_key and overwrite each other, which is worse than
+        # dropping. Shouldn't happen in practice (engine logs them as
+        # 'not_eligible: missing ref') but be defensive.
+        batch = [b for b in batch if b["row_key"].rsplit(":", 1)[-1]]
 
         def _on_chunk(sent, total):
             on_progress(
@@ -227,13 +259,18 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
         summary["views_succeeded"].append(view_name)
         summary["per_view"][view_name] = {
             "rows":           view_uploaded,
-            "engine_rows":    len(all_rows),
+            "engine_rows":    engine_total,
+            "flagged":        len(flagged),
+            "accepted":       len(accepted_lst),
+            "not_eligible":   len(not_eligible),
             "expected_total": payload.get("expected_total"),
             "missing_count":  payload.get("missing_count"),
             "partial":        payload.get("partial", False),
         }
         on_progress(
-            f"[{view_name}] uploaded {view_uploaded}/{len(all_rows)} rows",
+            f"[{view_name}] uploaded {view_uploaded}/{engine_total} rows "
+            f"(flagged={len(flagged)} accepted={len(accepted_lst)} "
+            f"not_eligible={len(not_eligible)})",
             level="info",
         )
 
