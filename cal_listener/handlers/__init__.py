@@ -46,6 +46,7 @@ HANDLERS: Dict[str, Callable] = {
     "dm_docket_search":          _lazy("cal_listener.handlers.dm_docket_search"),
     "revenue_breakdown_scraper": _lazy("cal_listener.handlers.revenue_breakdown_scraper"),
     "tariff_retrigger_dry_run":  _lazy("cal_listener.handlers.tariff_retrigger_dry_run"),
+    "tariff_assigner":           _lazy("cal_listener.handlers.tariff_assigner"),
     "dm_daily_check":            _lazy("cal_listener.handlers.dm_daily_check"),
     "invoice_plan_run":          _lazy("cal_listener.handlers.invoice_plan_run"),
 
