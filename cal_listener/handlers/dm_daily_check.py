@@ -87,6 +87,66 @@ def _clean(s) -> str:
     return str(s).rstrip(" ¬¶\t").strip()
 
 
+def _norm_for_match(s) -> str:
+    """Aggressive normalisation for fuzzy customer-name matching.
+    Lowercase, strip everything that isn't alphanumeric. Designed to
+    make 'HSS Pro Service (One Call)@' and 'HSS Pro Service (One Call)'
+    compare equal so a DM data-entry error can be flagged."""
+    return "".join(c.lower() for c in (s or "") if c.isalnum())
+
+
+def _find_stale_keys(ctx, company: str, scraped_keys: set[str]) -> list[str]:
+    """Return row_keys in shared_rows for this company that AREN'T in
+    the current scrape. These are leftovers from past scrapes — the
+    booking has since been completed/cancelled or the ref disappeared
+    from DM — and should be deleted so the web doesn't accumulate ghosts.
+    """
+    target_prefix = f"{(company or '').lower()}:"
+    PAGE = 1000
+    stale: list[str] = []
+    for offset in range(0, 50_000, PAGE):
+        rows = ctx.sb.get(
+            f"shared_rows?dataset=eq.dm_daily_check"
+            f"&select=row_key&limit={PAGE}&offset={offset}"
+        )
+        if not isinstance(rows, list) or not rows:
+            break
+        for r in rows:
+            rk = r.get("row_key") or ""
+            if rk.startswith(target_prefix) and rk not in scraped_keys:
+                stale.append(rk)
+        if len(rows) < PAGE:
+            break
+    return stale
+
+
+def _delete_keys(ctx, row_keys: list[str], on_progress) -> int:
+    """Delete `row_keys` from `shared_rows` (dataset=dm_daily_check).
+    Uses PostgREST `row_key=in.(...)` filter. URL has a length limit
+    so we chunk.
+    """
+    import urllib.parse as _urlp
+    deleted = 0
+    CHUNK = 50  # keep URL under PostgREST default 8 KB limit
+    for i in range(0, len(row_keys), CHUNK):
+        chunk = row_keys[i:i + CHUNK]
+        # PostgREST in.(...) needs each value wrapped in double quotes
+        # so embedded colons (our format is `company:view:ref`) don't
+        # break parsing.
+        quoted = ",".join(
+            '"' + _urlp.quote(k, safe="") + '"' for k in chunk
+        )
+        path = (f"shared_rows?dataset=eq.dm_daily_check"
+                f"&row_key=in.({quoted})")
+        try:
+            ctx.sb.delete(path)
+            deleted += len(chunk)
+        except Exception as e:
+            on_progress(f"  stale-row delete chunk failed: {e}",
+                        level="warning")
+    return deleted
+
+
 def _fetch_decision_history(ctx, company: str, on_progress) -> dict:
     """Pull the user's prior decisions for `company` from
     `dm_daily_decision_history`. Returns a dict keyed by `our_ref`
@@ -251,18 +311,25 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
     # heuristics, which is what made the Customer/Cust.Ref columns
     # swap on the Steven view.
     #
+    # We ALSO use the list here in the handler to detect row-level
+    # swaps (DM data-entry errors where the user put the customer
+    # name in the cust_ref field and vice versa).
+    #
     # Company can be overridden per-job via params (web can pass
     # {"company": "south"}). Falls back to context default ('north').
     company = (params.get("company") or "").strip().lower() \
               or _company_from_ctx(ctx)
+    tms_normed: set[str] = set()
     try:
         names = _fetch_customer_names(ctx, company, on_progress)
         out_path = workdir / f"tms_customers_{company}.json"
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump({"company": company, "names": names}, f, ensure_ascii=False)
+        tms_normed = {n for n in (_norm_for_match(x) for x in names) if n}
         on_progress(
             f"Wrote {len(names)} TMS customer names to "
-            f"{out_path.name} for column disambiguation",
+            f"{out_path.name} for column disambiguation "
+            f"({len(tms_normed)} after normalisation)",
             level="info",
         )
     except Exception as e:
@@ -291,6 +358,7 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
     now_iso = datetime.now(timezone.utc).isoformat()
     on_progress(f"Using company={company!r} for row_key namespacing",
                 level="info")
+    scraped_keys: set[str] = set()
 
     # 4a. Load user decisions so we can preserve them on this re-scrape.
     # Without this overlay, every scrape resets categorisation from the
@@ -334,33 +402,38 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
 
         def _build(row, default_decision):
             our_ref = (row.get("our_ref") or "").strip()
-            # If the user has decided on this row before, that wins
-            # over the rule engine's default. Tracked in the
-            # `decision_source` field so the UI can distinguish
-            # rule-based defaults from preserved user choices.
             user_decision = history_map.get(our_ref) if our_ref else None
             effective = user_decision or default_decision
+            customer = _clean(row.get("customer"))
+            cust_ref = _clean(row.get("cust_ref"))
+
+            # Swap detector: if the customer field doesn't look like a
+            # known customer but the cust_ref field DOES, the DM row
+            # was probably entered with the two fields swapped. We
+            # don't auto-correct (could be wrong), just flag for
+            # human review on the web. Catches data-entry errors at
+            # the booking source.
+            suspected_swap = False
+            if tms_normed:
+                cust_n = _norm_for_match(customer)
+                ref_n  = _norm_for_match(cust_ref)
+                if cust_n and ref_n and cust_n not in tms_normed and ref_n in tms_normed:
+                    suspected_swap = True
+
             data = {
                 "view":              view_name,
                 "company":           company,
                 "our_ref":           our_ref,
-                # Alias `ref` for the web app's Reference column —
-                # DMDailyCheck.tsx reads `d.ref || d.bt_ref`.
                 "ref":               our_ref,
-                "cust_ref":          _clean(row.get("cust_ref")),
-                "customer":          _clean(row.get("customer")),
+                "cust_ref":          cust_ref,
+                "customer":          customer,
                 "status":            row.get("status") or "",
                 "del_date":          row.get("del_date") or "",
                 "reasons":           row.get("reasons") or "",
-                # The rule engine's default classification, kept so
-                # the web can tell what would have happened without
-                # user input.
                 "_default_decision": default_decision,
-                # The effective tab — user decision if it exists,
-                # otherwise the rule default. This is what classifyTab
-                # reads on the web.
                 "tab":               effective,
                 "decision_source":   "user" if user_decision else "rules",
+                "suspected_swap":    suspected_swap,
                 "scraped_at":        now_iso,
                 "scraped_by":        ctx.settings.listener_id,
             }
@@ -393,6 +466,10 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
                 "shared_rows", batch, chunk_size=200,
                 progress=_on_chunk,
             )
+            # Track keys we DID upload so we can clean up rows from
+            # previous scrapes that aren't in DM today.
+            for b in batch:
+                scraped_keys.add(b["row_key"])
         except Exception as e:
             on_progress(f"[{view_name}] bulk upload failed: {e}",
                         level="warning")
@@ -417,6 +494,25 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
         )
 
     summary["rows_uploaded"] = total_uploaded
+
+    # 4b. Stale-row cleanup. Anything still in shared_rows for THIS
+    # company that we didn't write in THIS scrape is a leftover from
+    # a previous run (the booking was completed/cancelled, the BT-ref
+    # was removed, or the row was scraped under a different view
+    # name). Delete it so the web doesn't accumulate ghosts.
+    try:
+        stale = _find_stale_keys(ctx, company, scraped_keys)
+        if stale:
+            on_progress(
+                f"Cleaning up {len(stale)} stale rows from prior scrapes "
+                f"(no longer present in DM)",
+                level="info",
+            )
+            _delete_keys(ctx, stale, on_progress)
+        else:
+            on_progress("No stale rows to clean up", level="info")
+    except Exception as e:
+        on_progress(f"Stale-row cleanup skipped: {e}", level="warning")
 
     final_msg = (
         f"Done — {len(summary['views_succeeded'])} views, "

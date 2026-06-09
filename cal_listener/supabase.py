@@ -69,6 +69,13 @@ class Supabase:
             headers=self._h, json=row, timeout=15)
         self._check(r, "insert", table)
 
+    def delete(self, path: str) -> None:
+        """DELETE /rest/v1/{path}. Pass the full filter in `path`, e.g.
+        `shared_rows?dataset=eq.dm_daily_check&row_key=in.("a","b")`."""
+        r = requests.delete(
+            f"{self.url}/rest/v1/{path}", headers=self._h, timeout=30)
+        self._check(r, "delete", path)
+
     def patch(self, table: str, where: str, row: Dict[str, Any]) -> None:
         r = requests.patch(
             f"{self.url}/rest/v1/{table}?{where}",
