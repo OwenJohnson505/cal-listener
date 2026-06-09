@@ -52,6 +52,13 @@ HANDLERS: Dict[str, Callable] = {
     # ----- File-processor reports (no DM, no browser) ----------------------
     "bookings_report":           _lazy("cal_listener.handlers.bookings_report"),
     "maersk_report":             _lazy("cal_listener.handlers.maersk_report"),
+    "staci_weekly":              _lazy("cal_listener.handlers.staci_weekly"),
+    "consignment_cross_ref":     _lazy("cal_listener.handlers.consignment_cross_ref"),
+    "lpo_report":                _lazy("cal_listener.handlers.consignment_cross_ref"),
+    "job_reconciliation":        _lazy("cal_listener.handlers.job_reconciliation"),
+    "intercompany_reconciliation": _lazy("cal_listener.handlers.intercompany_reconciliation"),
+    "anomaly_alerts":            _lazy("cal_listener.handlers.anomaly_alerts"),
+    "debtor_dashboard":          _lazy("cal_listener.handlers.debtor_dashboard"),
     "invoice_plan_run":          _lazy("cal_listener.handlers.invoice_plan_run"),
 
     # ----- ClearBooks-driven (browser automation via Playwright) ----------
