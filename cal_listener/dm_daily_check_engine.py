@@ -231,11 +231,25 @@ STATUS_VALUES = {
 
 
 def _load_tms_customer_names(company=None):
-    """Load known TMS customer names for a company ('north'/'south') from the
-    invoicing-rules store, normalised for matching. Returns (company, set).
-    Empty set on any failure - the resolver then falls back to content
-    heuristics, so this never blocks a run."""
+    """Load known TMS customer names for a company ('north'/'south').
+
+    Two sources, tried in order:
+
+      1. The desktop's local `invoice_store` module (present when the
+         engine runs as part of the desktop CalToolkit).
+      2. `tms_customers_<company>.json` in SCRIPT_DIR — written by the
+         cal_listener handler before each scrape, populated from the
+         Supabase `customer_profiles` dataset. This is the listener's
+         equivalent and the path that fires for the bundled .exe.
+
+    Returns (company, normalised-set). Empty set on any failure - the
+    resolver then falls back to content heuristics, so this never
+    blocks a run, but column disambiguation will be weaker (we saw
+    Customer/Cust.Ref swap on the Steven view without this list).
+    """
     co = company or os.environ.get("DM_COMPANY") or ""
+
+    # Source 1: desktop's invoice_store.
     try:
         ir_dir = SCRIPT_DIR.parent / "invoicing_rules"
         if str(ir_dir) not in sys.path:
@@ -250,8 +264,33 @@ def _load_tms_customer_names(company=None):
             return co, _ncn(names)
         return co, set()
     except Exception as e:
-        print(f"  (TMS customer-list load failed: {e}; using content heuristics)", flush=True)
-        return (co or "north"), set()
+        # Fall through to source 2 — don't print a scary failure line
+        # yet, the JSON sidecar might cover us.
+        invoice_store_err = e
+
+    # Source 2: listener-side JSON sidecar.
+    try:
+        json_co = co or "north"
+        sidecar = SCRIPT_DIR / f"tms_customers_{json_co}.json"
+        if sidecar.exists():
+            import json as _json
+            with sidecar.open(encoding="utf-8") as f:
+                blob = _json.load(f)
+            names = blob.get("names") or []
+            if _resolve_columns_v2 is not None:
+                from dm_columns import normalise_customer_names as _ncn  # type: ignore
+                normed = _ncn(names)
+            else:
+                normed = set()
+            print(f"  TMS customer-list loaded from {sidecar.name}: "
+                  f"{len(names)} names", flush=True)
+            return json_co, normed
+    except Exception as je:
+        print(f"  (TMS sidecar load also failed: {je})", flush=True)
+
+    print(f"  (TMS customer-list load failed: {invoice_store_err}; "
+          "using content heuristics)", flush=True)
+    return (co or "north"), set()
 
 
 # ---------- UIA helpers ----------

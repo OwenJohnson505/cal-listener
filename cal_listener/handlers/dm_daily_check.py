@@ -77,6 +77,42 @@ def _company_from_ctx(ctx) -> str:
     return val.lower()
 
 
+def _fetch_customer_names(ctx, company: str, on_progress) -> list[str]:
+    """Pull the TMS customer name list for `company` from Supabase
+    (dataset `customer_profiles`). The desktop's `invoice_store` does
+    the same thing locally; we replicate it here because that module
+    isn't bundled with the listener.
+
+    Returns a deduplicated list of names — both `primary_name` and
+    every entry in `tms_names`. Paginates because PostgREST caps
+    a single GET at 1000.
+    """
+    target = (company or "").lower()
+    PAGE = 1000
+    seen: set[str] = set()
+    out: list[str] = []
+    for offset in range(0, 20_000, PAGE):
+        rows = ctx.sb.get(
+            f"shared_rows?dataset=eq.customer_profiles"
+            f"&select=data&limit={PAGE}&offset={offset}"
+        )
+        if not isinstance(rows, list) or not rows:
+            break
+        for r in rows:
+            d = r.get("data") or {}
+            depot = (d.get("depot") or "").lower()
+            if depot != target:
+                continue
+            for n in [d.get("primary_name", ""), *(d.get("tms_names") or [])]:
+                s = (n or "").strip()
+                if s and s.lower() not in seen:
+                    seen.add(s.lower())
+                    out.append(s)
+        if len(rows) < PAGE:
+            break
+    return out
+
+
 def _stream_subprocess(cmd, on_progress):
     """Run `cmd` and pipe every stdout line to on_progress.
     Returns the subprocess exit code."""
@@ -164,6 +200,36 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
             except Exception:
                 pass
 
+    # 2b. Fetch the TMS customer name list for this company and drop it
+    # in the workdir as `tms_customers_<company>.json`. The engine's
+    # _load_tms_customer_names() consults this file when its local
+    # `invoice_store` module isn't bundled (which it isn't in the
+    # listener). Without this the engine falls back to content
+    # heuristics, which is what made the Customer/Cust.Ref columns
+    # swap on the Steven view.
+    #
+    # Company can be overridden per-job via params (web can pass
+    # {"company": "south"}). Falls back to context default ('north').
+    company = (params.get("company") or "").strip().lower() \
+              or _company_from_ctx(ctx)
+    try:
+        names = _fetch_customer_names(ctx, company, on_progress)
+        out_path = workdir / f"tms_customers_{company}.json"
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump({"company": company, "names": names}, f, ensure_ascii=False)
+        on_progress(
+            f"Wrote {len(names)} TMS customer names to "
+            f"{out_path.name} for column disambiguation",
+            level="info",
+        )
+    except Exception as e:
+        on_progress(f"Couldn't fetch TMS customer list: {e} — "
+                    "engine will fall back to content heuristics",
+                    level="warning")
+    # Pass the company through to the engine subprocess so its
+    # _load_tms_customer_names() knows which file to look for.
+    os.environ["DM_COMPANY"] = company
+
     # 3. Launch the engine orchestrator.
     on_progress("Starting DM Daily Check engine (desktop v46)", percent=10)
     cmd = _engine_command()
@@ -180,7 +246,6 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
     on_progress(f"Uploading scraped rows to Supabase (from {results_dir})",
                 percent=88)
     now_iso = datetime.now(timezone.utc).isoformat()
-    company = _company_from_ctx(ctx)
     on_progress(f"Using company={company!r} for row_key namespacing",
                 level="info")
     total_uploaded = 0
