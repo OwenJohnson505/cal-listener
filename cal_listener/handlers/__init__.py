@@ -54,9 +54,12 @@ HANDLERS: Dict[str, Callable] = {
     "maersk_report":             _lazy("cal_listener.handlers.maersk_report"),
     "invoice_plan_run":          _lazy("cal_listener.handlers.invoice_plan_run"),
 
-    # ----- ClearBooks-driven (browser automation) --------------------------
+    # ----- ClearBooks-driven (browser automation via Playwright) ----------
+    # First-time setup: run cb_login once per listener so the persistent
+    # profile in %APPDATA%\CalListener\cb_profile gets a valid CB session.
+    "cb_login":                  _lazy("cal_listener.handlers.cb_login"),
     "cb_create_bill":            _lazy("cal_listener.handlers.cb_create_bill"),
-    "cb_edit_bill":               _lazy("cal_listener.handlers.cb_edit_bill"),
+    "cb_edit_bill":              _lazy("cal_listener.handlers.cb_edit_bill"),
     "cb_credit_note":            _lazy("cal_listener.handlers.cb_credit_note"),
     "cb_mark_bill_paid":         _lazy("cal_listener.handlers.cb_mark_bill_paid"),
     "cb_money_in_out":           _lazy("cal_listener.handlers.cb_money_in_out"),

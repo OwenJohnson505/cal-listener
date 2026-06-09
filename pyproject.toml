@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cal-listener"
-version = "1.4.6"
+version = "1.4.7"
 description = "Job-queue worker for Cal Toolkit Web — drives Delivery Master and ClearBooks from queued jobs."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -30,6 +30,12 @@ windows = [
     # makes --collect-all PIL actually bundle the package and dodges
     # the whole fallback path.
     "Pillow>=10.0",
+    # Playwright drives ClearBooks for the cb_* handlers. After
+    # installing, the listener also needs the chromium binary:
+    #   playwright install chromium
+    # The bundled .exe currently doesn't ship chromium; the setup script
+    # runs the playwright install step on first install.
+    "playwright>=1.40",
 ]
 dev = [
     "pyinstaller>=6.7",
