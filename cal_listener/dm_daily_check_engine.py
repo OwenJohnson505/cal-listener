@@ -106,6 +106,13 @@ try:
     from pywinauto.controls.uiawrapper import UIAWrapper  # type: ignore
     from pywinauto.keyboard import send_keys  # type: ignore
 except ImportError:
+    # In a frozen .exe `sys.executable` is the listener itself, so a
+    # subprocess pip install would just launch another daemon and hit
+    # the singleton mutex. Skip the fallback when frozen — pywinauto
+    # is bundled via --collect-all, so this only fires if something
+    # broke at build time.
+    if getattr(sys, "frozen", False):
+        raise
     subprocess.check_call([sys.executable, "-m", "pip", "install", "pywinauto"])
     from pywinauto import Desktop  # type: ignore
     from pywinauto.controls.uiawrapper import UIAWrapper  # type: ignore
@@ -117,6 +124,8 @@ try:
     from openpyxl.worksheet.datavalidation import DataValidation  # type: ignore
     from openpyxl.utils import get_column_letter  # type: ignore
 except ImportError:
+    if getattr(sys, "frozen", False):
+        raise
     subprocess.check_call([sys.executable, "-m", "pip", "install", "openpyxl"])
     from openpyxl import Workbook, load_workbook  # type: ignore
     from openpyxl.styles import Font, PatternFill  # type: ignore
@@ -127,11 +136,17 @@ except ImportError:
 try:
     from PIL import ImageGrab  # type: ignore
 except ImportError:
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "Pillow"])
-        from PIL import ImageGrab  # type: ignore
-    except Exception:
+    if getattr(sys, "frozen", False):
+        # OCR is optional — the v2 dm_columns resolver doesn't need it.
+        # Just leave ImageGrab as None; no pip install in frozen mode
+        # (it would re-launch CalListener.exe and hit the singleton).
         ImageGrab = None  # type: ignore
+    else:
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "Pillow"])
+            from PIL import ImageGrab  # type: ignore
+        except Exception:
+            ImageGrab = None  # type: ignore
 
 # v2 column resolver (content-first, screen-independent). Demotes the fragile
 # OCR/heuristic path to a fallback. If the module is missing for any reason we

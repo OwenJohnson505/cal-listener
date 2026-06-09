@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cal-listener"
-version = "1.3.1"
+version = "1.3.2"
 description = "Job-queue worker for Cal Toolkit Web — drives Delivery Master and ClearBooks from queued jobs."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,6 +22,14 @@ windows = [
     "pywin32>=306",
     "psutil>=5.9",
     "openpyxl>=3.1",
+    # Pillow gives the bundled dm_daily_check_engine its optional OCR
+    # header screenshot path. The engine tries to pip install it on
+    # import failure — in a frozen .exe that re-launches CalListener.exe
+    # itself, which hits the singleton mutex and prints nuisance
+    # "another instance already running" messages. Including it here
+    # makes --collect-all PIL actually bundle the package and dodges
+    # the whole fallback path.
+    "Pillow>=10.0",
 ]
 dev = [
     "pyinstaller>=6.7",
