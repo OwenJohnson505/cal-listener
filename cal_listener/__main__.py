@@ -19,7 +19,26 @@ import os
 import sys
 
 
-_VERSION = "1.3.3"
+# Force UTF-8 stdio so we can safely print characters from the desktop
+# engine (em-dashes, copyright symbols, pound signs, anything outside
+# cp1252's repertoire). Without this:
+#  * Engine print() of "Delivery Master — v46" succeeds-with-mojibake
+#    in cp1252 (em-dash → 0x97 byte).
+#  * Reader in the parent decodes 0x97 as invalid UTF-8 → �.
+#  * Reader's print(line) to its own cp1252 stdout fails because
+#    cp1252 has no glyph for � → UnicodeEncodeError → orchestrator
+#    aborts mid-stream and the per-view subprocess never gets to run.
+# This MUST run before any other module is imported (especially the
+# engine, which prints from module-level code).
+for _stream_name in ("stdout", "stderr"):
+    _stream = getattr(sys, _stream_name, None)
+    if _stream is not None and hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+_VERSION = "1.3.4"
 
 
 def _dispatch_engine_modes():
