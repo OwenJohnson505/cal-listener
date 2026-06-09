@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cal-listener"
-version = "1.4.8"
+version = "1.4.9"
 description = "Job-queue worker for Cal Toolkit Web — drives Delivery Master and ClearBooks from queued jobs."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -33,19 +33,4 @@ windows = [
     # Playwright drives ClearBooks for the cb_* handlers. After
     # installing, the listener also needs the chromium binary:
     #   playwright install chromium
-    # The bundled .exe currently doesn't ship chromium; the setup script
-    # runs the playwright install step on first install.
-    "playwright>=1.40",
-    # pdfplumber gives consignment_cross_ref / lpo-report a pure-Python
-    # fallback when poppler-utils isn't on the listener PATH.
-    "pdfplumber>=0.10",
-]
-dev = [
-    "pyinstaller>=6.7",
-]
-
-[project.scripts]
-cal-listener = "cal_listener.daemon:main"
-
-[tool.setuptools.packages.find]
-include = ["cal_listener*"]
+  

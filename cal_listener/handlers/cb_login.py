@@ -10,13 +10,32 @@ params:
   timeout_seconds  int, how long to wait for login completion (default 300)
 """
 from __future__ import annotations
+import os
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict
+
+
+def _configure_playwright_browsers_path() -> str:
+    """Force Playwright to look in the standard user-profile cache
+    (`%USERPROFILE%\\AppData\\Local\\ms-playwright`) instead of the
+    bundled PyInstaller temp-extract directory. Without this the frozen
+    .exe can't find a chromium binary installed by `playwright install`.
+    Returns the path it set."""
+    if os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
+        return os.environ["PLAYWRIGHT_BROWSERS_PATH"]
+    home = os.environ.get("USERPROFILE") or str(Path.home())
+    target = str(Path(home) / "AppData" / "Local" / "ms-playwright")
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = target
+    return target
 
 
 def run(params: Dict[str, Any], on_progress: Callable[..., None],
         ctx) -> Dict[str, Any]:
     timeout = int(params.get("timeout_seconds") or 300)
+
+    browsers_path = _configure_playwright_browsers_path()
+    on_progress(f"Playwright browsers path: {browsers_path}", percent=2)
 
     try:
         from playwright.sync_api import sync_playwright

@@ -20,12 +20,21 @@ profile so the user only logs in once across the whole toolkit family.
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
+
+# Force the bundled Playwright to use the standard user-profile cache for
+# the chromium binary, not the PyInstaller temp-extract directory. Must
+# happen BEFORE any `from playwright.sync_api import ...` to take effect.
+if not os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
+    _home = os.environ.get("USERPROFILE") or str(Path.home())
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(
+        Path(_home) / "AppData" / "Local" / "ms-playwright")
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent

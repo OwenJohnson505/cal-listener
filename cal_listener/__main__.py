@@ -38,7 +38,7 @@ for _stream_name in ("stdout", "stderr"):
         except Exception:
             pass
 
-_VERSION = "1.4.8"
+_VERSION = "1.4.9"
 
 
 def _dispatch_engine_modes():
