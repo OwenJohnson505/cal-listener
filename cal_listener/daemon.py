@@ -178,6 +178,13 @@ class Listener:
         log.info("listener %s starting (host=%s)",
                  self.s.listener_id, socket.gethostname())
         self.register()
+        # Start the DM Daily Check scheduler thread (fires runs at 06:30/14:00
+        # by default; configurable via the Schedule panel in the web app).
+        try:
+            from cal_listener import dm_daily_scheduler
+            dm_daily_scheduler.start()
+        except Exception:
+            log.exception("dm_daily_scheduler: failed to start")
         last_reap = 0.0
         try:
             while not self._stop:
