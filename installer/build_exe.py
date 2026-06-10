@@ -59,6 +59,11 @@ def main():
         # resolver, but bundling it costs nothing and avoids a noisy
         # warning at startup.
         "--collect-all", "PIL",
+        # tzdata supplies the IANA timezone database (Europe/London etc.)
+        # to zoneinfo on Windows. Without bundling its data files, the
+        # dm_daily_scheduler crashes at startup with
+        # "ZoneInfoNotFoundError: 'No time zone found with key Europe/London'".
+        "--collect-all", "tzdata",
         "--hidden-import", "psutil",
         "--hidden-import", "win32api",
         "--hidden-import", "win32con",

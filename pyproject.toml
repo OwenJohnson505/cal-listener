@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cal-listener"
-version = "1.4.11"
+version = "1.4.12"
 description = "Job-queue worker for Cal Toolkit Web — drives Delivery Master and ClearBooks from queued jobs."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -39,6 +39,10 @@ windows = [
     # pdfplumber gives consignment_cross_ref / lpo-report a pure-Python
     # fallback when poppler-utils isn't on the listener PATH.
     "pdfplumber>=0.10",
+    # tzdata supplies the IANA timezone database on Windows so
+    # zoneinfo.ZoneInfo("Europe/London") works inside the frozen .exe.
+    # Used by dm_daily_scheduler for BST-aware schedule firing.
+    "tzdata>=2024.1",
 ]
 dev = [
     "pyinstaller>=6.7",
