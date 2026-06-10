@@ -182,7 +182,7 @@ class Listener:
         # by default; configurable via the Schedule panel in the web app).
         try:
             from cal_listener import dm_daily_scheduler
-            dm_daily_scheduler.start()
+            dm_daily_scheduler.start(self.sb)
         except Exception:
             log.exception("dm_daily_scheduler: failed to start")
         last_reap = 0.0

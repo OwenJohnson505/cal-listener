@@ -15,22 +15,24 @@ Owen's spec:
   slot regardless of the previous outcome.
 - Track the last-fired slot per local-day so we don't double-fire after a
   daemon restart in the same hour.
+
+Uses the listener's existing `Supabase` HTTP wrapper (REST/PostgREST via
+`get`/`upsert`/`insert`) rather than the supabase-py SDK.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
-import time
-from datetime import date, datetime, timedelta
+import urllib.parse
+from datetime import datetime, timedelta
 from typing import Optional
 
 try:
     from zoneinfo import ZoneInfo
 except ImportError:  # pragma: no cover
     from backports.zoneinfo import ZoneInfo  # type: ignore
-
-from cal_listener import supabase
 
 log = logging.getLogger(__name__)
 
@@ -54,8 +56,9 @@ def _today_key() -> str:
 class DmDailyScheduler(threading.Thread):
     """Background thread that fires DM Daily Check on schedule."""
 
-    def __init__(self, *, daemon: bool = True) -> None:
+    def __init__(self, sb, *, daemon: bool = True) -> None:
         super().__init__(daemon=daemon, name="DmDailyScheduler")
+        self._sb = sb
         self._stop_event = threading.Event()
         # Per-day cache of already-fired slots: { "2026-06-10": {"morning", "afternoon"} }
         self._fired_today: dict[str, set[str]] = {}
@@ -131,12 +134,15 @@ class DmDailyScheduler(threading.Thread):
 
     def _load_schedule_config(self) -> Optional[dict]:
         try:
-            res = supabase.client().table("shared_rows").select("data").eq(
-                "dataset", "dm_daily_schedule"
-            ).eq("row_key", "config").maybe_single().execute()
-            if not res or not res.data:
+            res = self._sb.get(
+                "shared_rows?dataset=eq.dm_daily_schedule&row_key=eq.config&select=data"
+            )
+            if not res:
                 return None
-            return res.data.get("data") or {}
+            # PostgREST returns a list; take the first row's `data` jsonb.
+            if isinstance(res, list) and res:
+                return res[0].get("data") or {}
+            return None
         except Exception:
             log.exception("dm_daily_scheduler: load config failed")
             return None
@@ -145,14 +151,16 @@ class DmDailyScheduler(threading.Thread):
         """Populate fired_today from runs that already happened today (so
         restarts don't double-fire)."""
         today_start = _now_uk().replace(hour=0, minute=0, second=0, microsecond=0)
-        res = supabase.client().table("shared_rows").select("data").eq(
-            "dataset", "dm_daily_runs"
-        ).gt("updated_at", today_start.astimezone().isoformat()).limit(20).execute()
-        if not res or not res.data:
+        # PostgREST `gt` filter on updated_at timestamp
+        ts_q = urllib.parse.quote(today_start.isoformat())
+        res = self._sb.get(
+            f"shared_rows?dataset=eq.dm_daily_runs&updated_at=gt.{ts_q}&select=data&limit=20"
+        )
+        if not res or not isinstance(res, list):
             return
         today_key = _today_key()
         fired = self._fired_today.setdefault(today_key, set())
-        for row in res.data:
+        for row in res:
             d = (row or {}).get("data") or {}
             slot = d.get("slot")
             if slot in {"morning", "afternoon"}:
@@ -161,10 +169,10 @@ class DmDailyScheduler(threading.Thread):
 
     def _fire_slot(self, slot_name: str, slot_dt: datetime) -> None:
         run_key = f"{slot_name}_{slot_dt.strftime('%Y%m%d_%H%M')}"
-        scheduled_iso = slot_dt.astimezone().isoformat()
-        now_iso = datetime.now().astimezone().isoformat()
+        scheduled_iso = slot_dt.isoformat()
+        now_iso = datetime.now(tz=UK_TZ).isoformat()
         # Write the run row first
-        supabase.client().table("shared_rows").upsert({
+        self._sb.upsert("shared_rows", {
             "dataset": "dm_daily_runs",
             "row_key": run_key,
             "data": {
@@ -175,23 +183,23 @@ class DmDailyScheduler(threading.Thread):
                 "slot": slot_name,
             },
             "updated_at": now_iso,
-        }, on_conflict="dataset,row_key").execute()
+        })
         # Then queue the job
-        supabase.client().table("job_queue").insert({
+        self._sb.insert("job_queue", {
             "plugin": "dm_daily_check",
             "params": {"run_key": run_key, "slot": slot_name},
             "status": "pending",
             "requested_by": "scheduler",
-        }).execute()
+        })
 
     def _record_missed(self, slot_name: str, slot_dt: datetime, alert_email: str) -> None:
         run_key = f"{slot_name}_{slot_dt.strftime('%Y%m%d_%H%M')}"
-        now_iso = datetime.now().astimezone().isoformat()
-        supabase.client().table("shared_rows").upsert({
+        now_iso = datetime.now(tz=UK_TZ).isoformat()
+        self._sb.upsert("shared_rows", {
             "dataset": "dm_daily_runs",
             "row_key": run_key,
             "data": {
-                "scheduled_at": slot_dt.astimezone().isoformat(),
+                "scheduled_at": slot_dt.isoformat(),
                 "started_at": None,
                 "completed_at": None,
                 "status": "failed",
@@ -200,22 +208,23 @@ class DmDailyScheduler(threading.Thread):
                 "alert_sent_to": alert_email,
             },
             "updated_at": now_iso,
-        }, on_conflict="dataset,row_key").execute()
-        # Also drop a notification row (Lauren-facing). The web cron will
-        # actually send the email; the row is the durable record.
-        supabase.client().table("shared_rows").upsert({
+        })
+        # Also drop a notification row (Lauren-facing). The Vercel-side
+        # follow-up cron will actually send the email; the row is the
+        # durable record.
+        self._sb.upsert("shared_rows", {
             "dataset": "dm_daily_alerts",
             "row_key": f"missed_{run_key}",
             "data": {
                 "kind": "missed_slot",
                 "slot": slot_name,
-                "scheduled_at": slot_dt.astimezone().isoformat(),
+                "scheduled_at": slot_dt.isoformat(),
                 "alert_email": alert_email,
                 "created_at": now_iso,
-                "sent_at": None,  # web cron sets this
+                "sent_at": None,
             },
             "updated_at": now_iso,
-        }, on_conflict="dataset,row_key").execute()
+        })
 
     def _gc_fired_cache(self) -> None:
         # Only keep the last 3 days of fired tracking to avoid an unbounded dict
@@ -242,12 +251,15 @@ def _parse_time_today(hhmm: str, now: datetime) -> Optional[datetime]:
 _INSTANCE: Optional[DmDailyScheduler] = None
 
 
-def start() -> None:
-    """Start the scheduler thread once. Safe to call multiple times."""
+def start(sb) -> None:
+    """Start the scheduler thread once. Safe to call multiple times.
+
+    `sb` is the listener's `Supabase` HTTP wrapper from `daemon.self.sb`.
+    """
     global _INSTANCE
     if _INSTANCE is not None and _INSTANCE.is_alive():
         return
-    _INSTANCE = DmDailyScheduler()
+    _INSTANCE = DmDailyScheduler(sb)
     _INSTANCE.start()
     log.info("dm_daily_scheduler: thread started")
 
