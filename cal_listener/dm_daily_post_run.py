@@ -167,6 +167,13 @@ def trigger(sb, *, run_id: str, run_slot: str, on_progress) -> Dict[str, Any]:
         token_row_key = f"{run_id}_{owner_key}_{token[:8]}"
         review_url = f"{REVIEW_BASE_URL}/{urllib.parse.quote(token_row_key)}"
         now_iso = _now_iso()
+        # CRITICAL (v1.4.19): stamp the exact row_keys this manager is
+        # responsible for onto the token. The web review page reads from
+        # this list directly — no re-resolving, no re-filtering. This is
+        # the only way to guarantee the email count matches what the
+        # reviewer actually sees, even if profiles/data change between
+        # scrape time and click time.
+        row_keys = [r.get("row_key") for r in owner_rows if r.get("row_key")]
         token_data = {
             "token":              token,
             "run_id":             run_id,
@@ -175,6 +182,7 @@ def trigger(sb, *, run_id: str, run_slot: str, on_progress) -> Dict[str, Any]:
             "recipient_manager":  owner_key,
             "review_url":         review_url,
             "row_count":          len(owner_rows),
+            "row_keys":           row_keys,   # NEW — source of truth for the page
             "sent_at":            None,
             "clicked_at":         None,
             "submitted_at":       None,

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cal-listener"
-version = "1.4.18"
+version = "1.4.19"
 description = "Job-queue worker for Cal Toolkit Web — drives Delivery Master and ClearBooks from queued jobs."
 readme = "README.md"
 requires-python = ">=3.11"
