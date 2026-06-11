@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -60,7 +61,9 @@ class DmDailyFollowupThread(threading.Thread):
 
     def _tick(self) -> None:
         # Only walk tokens from the last 12 hours.
-        since = (_now() - timedelta(hours=12)).isoformat()
+        # urlquote the timestamp because the `+` in `+00:00` becomes a
+        # space when PostgREST URL-decodes the query string otherwise.
+        since = urllib.parse.quote((_now() - timedelta(hours=12)).isoformat())
         path = (
             "shared_rows?dataset=eq.dm_daily_review_tokens"
             f"&updated_at=gt.{since}"
