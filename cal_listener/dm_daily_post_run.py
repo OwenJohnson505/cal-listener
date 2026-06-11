@@ -42,25 +42,103 @@ def _expires_iso(hours: int = 12) -> str:
 
 
 def _fetch_customer_profiles(sb) -> Dict[str, dict]:
-    """Map lowercased primary_name + aliases -> profile.data dict."""
+    """Map lowercased name -> profile.data dict for customer-name lookups.
+
+    Post-migration (June 2026): the canonical name is `tms_name`. We also
+    index `xero_name` (the new alias for what used to be `clearbooks_name`)
+    and the legacy `primary_name` / `clearbooks_name` / `tms_names` /
+    `aliases` fields in case any stragglers escaped the migration. First
+    write to a key wins so the canonical name is preferred.
+    """
     out: Dict[str, dict] = {}
+    def _add(name: Any, profile: dict) -> None:
+        if not name:
+            return
+        k = str(name).lower().strip()
+        if k and k not in out:
+            out[k] = profile
     try:
-        res = sb.get("shared_rows?dataset=eq.customer_profiles&select=data&limit=5000")
+        res = sb.get("shared_rows?dataset=eq.customer_profiles&select=data&limit=10000")
         if isinstance(res, list):
             for row in res:
                 d = (row or {}).get("data") or {}
-                pn = d.get("primary_name")
-                if pn:
-                    out[str(pn).lower().strip()] = d
+                # Post-migration canonical names
+                _add(d.get("tms_name"),  d)
+                _add(d.get("xero_name"), d)
+                # Legacy fallbacks for any rows that escaped the migration
+                _add(d.get("primary_name"),    d)
+                _add(d.get("clearbooks_name"), d)
                 for alias in (d.get("tms_names") or []):
-                    if alias:
-                        out[str(alias).lower().strip()] = d
+                    _add(alias, d)
                 for alias in (d.get("aliases") or []):
-                    if alias:
-                        out[str(alias).lower().strip()] = d
+                    _add(alias, d)
+                for alias in (d.get("bank_names") or []):
+                    _add(alias, d)
     except Exception:
         log.exception("dm_daily_post_run: customer_profiles fetch failed")
     return out
+
+
+def _fetch_all_rows(sb) -> List[dict]:
+    """Pull every dm_daily_check row, paginated. Unlike the legacy
+    `_fetch_not_accepted_rows` this returns all three tabs (accepted,
+    not_accepted, not_eligible) so the manager review page can render
+    the full 3-bucket picture for each owner.
+    """
+    rows: List[dict] = []
+    offset = 0
+    page = 1000
+    while True:
+        path = (
+            "shared_rows?dataset=eq.dm_daily_check"
+            f"&select=row_key,data&limit={page}&offset={offset}"
+            "&order=row_key.asc"
+        )
+        try:
+            res = sb.get(path)
+        except Exception:
+            log.exception("dm_daily_post_run: fetch rows failed")
+            break
+        if not isinstance(res, list) or not res:
+            break
+        rows.extend(res)
+        if len(res) < page:
+            break
+        offset += page
+        if offset > 100_000:  # safety
+            break
+    return rows
+
+
+def _dedupe_by_ref(rows: List[dict]) -> List[dict]:
+    """A job that appears in multiple DM views (e.g. both 'In Progress'
+    and the per-manager view, or both 'Katie' and 'Complete') is the same
+    job — we don't want the manager seeing it twice in their review.
+
+    Keep the most-informative copy per Our Ref. Priority: not_accepted
+    (flagged for review) > accepted > not_eligible. This way if a Katie
+    job is flagged in 'Katie' view but accepted in 'Complete' (stale
+    artefact), the flagged copy is what we use.
+    """
+    PRIORITY = {"not_accepted": 0, "accepted": 1, "not_eligible": 2}
+    by_ref: Dict[str, dict] = {}
+    for row in rows:
+        d = row.get("data") or {}
+        ref = str(d.get("our_ref") or d.get("ref") or "").upper().strip()
+        if not ref:
+            continue
+        tab = d.get("tab") or "not_eligible"
+        prio = PRIORITY.get(tab, 99)
+        existing = by_ref.get(ref)
+        if existing is None:
+            by_ref[ref] = row
+            continue
+        ex_d   = existing.get("data") or {}
+        ex_tab = ex_d.get("tab") or "not_eligible"
+        ex_prio = PRIORITY.get(ex_tab, 99)
+        if prio < ex_prio:
+            by_ref[ref] = row
+    return list(by_ref.values())
 
 
 def _fetch_not_accepted_rows(sb) -> List[dict]:
@@ -199,39 +277,43 @@ def _filter_deferred_and_decrement(sb, rows: List[dict], run_id: str,
 
 
 def _build_email_body(manager: am.Manager, run_id: str, run_slot: str,
-                      row_count: int, review_url: str) -> tuple[str, str]:
-    """Return (subject, html_body) tailored for this manager."""
+                      counts: Dict[str, int], review_url: str) -> tuple[str, str]:
+    """Return (subject, plain_body) tailored for this manager.
+
+    counts is a dict with keys 'rejected' / 'accepted' / 'deferred' —
+    the per-bucket totals the manager will see in the new 3-bucket
+    review page. We include them in the email so the manager knows
+    upfront what to expect before opening the link.
+    """
     slot_label = "morning" if run_slot == "morning" else "afternoon"
-    subject = f"DM Daily Check — {row_count} item{'s' if row_count != 1 else ''} for your review"
+    n_review   = counts.get("rejected", 0)
+    n_accepted = counts.get("accepted", 0)
+    n_deferred = counts.get("deferred", 0)
+    total = n_review + n_accepted + n_deferred
+
+    if n_review > 0:
+        subject = (
+            f"DM Daily Check — {n_review} item{'s' if n_review != 1 else ''} "
+            f"need{'s' if n_review == 1 else ''} your review"
+        )
+    else:
+        subject = f"DM Daily Check — all {total} item{'s' if total != 1 else ''} current (nothing flagged)"
+
     greeting = "Hi team," if manager.team else f"Hi {manager.display.split()[0]},"
-    html = (
-        f"<p style='font-family:Segoe UI,Arial,sans-serif;font-size:14px'>{greeting}</p>"
-        f"<p style='font-family:Segoe UI,Arial,sans-serif;font-size:14px'>"
-        f"Yesterday's DM Daily Check {slot_label} run found "
-        f"<b>{row_count} item{'s' if row_count != 1 else ''}</b> flagged for "
-        f"{'your team' if manager.team else 'your accounts'}. "
-        f"Please review and submit before the next run.</p>"
-        f"<p style='font-family:Segoe UI,Arial,sans-serif;font-size:14px'>"
-        f"<a href='{review_url}' "
-        f"style='background:#0EA5A4;color:white;padding:10px 18px;"
-        f"border-radius:6px;text-decoration:none;font-weight:600;"
-        f"display:inline-block'>Open review</a></p>"
-        f"<p style='font-family:Segoe UI,Arial,sans-serif;font-size:12px;"
-        f"color:#64748b'>This link is unique to this run. If you don't act "
-        f"within 30 minutes you'll get a reminder; after 2 hours Max is "
-        f"copied in.</p>"
-    )
     plain = (
         f"{greeting}\n\n"
-        f"Yesterday's DM Daily Check {slot_label} run found {row_count} "
-        f"item{'s' if row_count != 1 else ''} flagged for "
-        f"{'your team' if manager.team else 'your accounts'}.\n\n"
+        f"Yesterday's DM Daily Check {slot_label} run found {total} "
+        f"item{'s' if total != 1 else ''} for "
+        f"{'your team' if manager.team else 'your accounts'}:\n\n"
+        f"  - {n_review} need{'s' if n_review == 1 else ''} your review (flagged by the rules)\n"
+        f"  - {n_accepted} already accepted\n"
+        f"  - {n_deferred} deferred\n\n"
         f"Open the review: {review_url}\n\n"
         f"This link is unique to this run. If you don't act within 30 "
         f"minutes you'll get a reminder; after 2 hours Max is copied in.\n\n"
         f"— Cal Toolkit"
     )
-    return subject, plain  # plain stored as body; html separately
+    return subject, plain
 
 
 def trigger(sb, *, run_id: str, run_slot: str, on_progress) -> Dict[str, Any]:
@@ -240,31 +322,40 @@ def trigger(sb, *, run_id: str, run_slot: str, on_progress) -> Dict[str, Any]:
     on_progress("Post-run: building per-manager review packages", level="info")
 
     profiles_by_name = _fetch_customer_profiles(sb)
-    rows = _fetch_not_accepted_rows(sb)
-    rows_before_defer = len(rows)
-    # Strip out items admins have deferred (Defer-N verdict) and
-    # decrement their runs_remaining counter so they reappear at the
-    # right time. Items with runs_remaining == 0 are not in the
-    # deferred set so they pass through normally.
-    rows = _filter_deferred_and_decrement(sb, rows, run_id, on_progress)
+    # Fetch ALL rows across all tabs (not just not_accepted). The new
+    # manager review page renders three buckets — Accepted, Rejected
+    # (the flagged ones), Deferred — so each manager needs to see every
+    # row owned by them, not just the rejects.
+    all_rows_raw = _fetch_all_rows(sb)
+
+    # Dedupe by Our Ref so a job that appears in multiple DM views
+    # (e.g. both 'Katie' and 'Complete') doesn't surface as two rows in
+    # the manager's review.
+    all_rows = _dedupe_by_ref(all_rows_raw)
+    rows_before_defer = len(all_rows)
+
+    # Strip out items admins have deferred via the web admin queue
+    # (Defer-N verdict) and decrement their runs_remaining counter.
+    all_rows = _filter_deferred_and_decrement(sb, all_rows, run_id, on_progress)
+
     on_progress(
-        f"Post-run: {rows_before_defer} not_accepted rows "
-        f"({rows_before_defer - len(rows)} deferred), "
-        f"{len(profiles_by_name)} profiles loaded",
+        f"Post-run: {len(all_rows_raw)} rows in dm_daily_check, "
+        f"{rows_before_defer} after dedupe, "
+        f"{rows_before_defer - len(all_rows)} admin-deferred, "
+        f"{len(profiles_by_name)} customer profiles loaded",
         level="info",
     )
 
-    # Group by review owner
+    # Group by review owner using customer-name routing
     by_owner: Dict[str, List[dict]] = {}
-    for row in rows:
+    for row in all_rows:
         d = row.get("data") or {}
         cust = d.get("customer") or ""
         prof = profiles_by_name.get(cust.lower().strip())
         mgr = am.resolve_review_owner(cust, prof)
         by_owner.setdefault(mgr.key, []).append(row)
 
-    # Skip managers whose entire row set was deferred — no point sending
-    # them an empty review link.
+    # Defensive: drop empty owners
     by_owner = {k: v for k, v in by_owner.items() if v}
 
     emails_sent = 0
@@ -275,6 +366,19 @@ def trigger(sb, *, run_id: str, run_slot: str, on_progress) -> Dict[str, Any]:
         mgr = am.MANAGERS.get(owner_key)
         if mgr is None:
             continue
+
+        # Compute per-bucket counts so the email body shows the manager
+        # what's waiting in each of the 3 buckets on the review page.
+        counts = {"rejected": 0, "accepted": 0, "deferred": 0}
+        for r in owner_rows:
+            tab = (r.get("data") or {}).get("tab") or ""
+            if tab == "not_accepted":
+                counts["rejected"] += 1
+            elif tab == "accepted":
+                counts["accepted"] += 1
+            else:
+                counts["deferred"] += 1
+
         token = secrets.token_urlsafe(24)
         token_row_key = f"{run_id}_{owner_key}_{token[:8]}"
         review_url = f"{REVIEW_BASE_URL}/{urllib.parse.quote(token_row_key)}"
@@ -295,6 +399,7 @@ def trigger(sb, *, run_id: str, run_slot: str, on_progress) -> Dict[str, Any]:
             "review_url":         review_url,
             "row_count":          len(owner_rows),
             "row_keys":           row_keys,   # NEW — source of truth for the page
+            "bucket_counts":      counts,     # NEW (v1.4.21): per-bucket totals for email + analytics
             "sent_at":            None,
             "clicked_at":         None,
             "submitted_at":       None,
@@ -318,7 +423,7 @@ def trigger(sb, *, run_id: str, run_slot: str, on_progress) -> Dict[str, Any]:
             continue
 
         # Build + send the email
-        subject, plain = _build_email_body(mgr, run_id, run_slot, len(owner_rows), review_url)
+        subject, plain = _build_email_body(mgr, run_id, run_slot, counts, review_url)
         ok = front_email.send_email(
             sb,
             to=mgr.email,
@@ -339,8 +444,13 @@ def trigger(sb, *, run_id: str, run_slot: str, on_progress) -> Dict[str, Any]:
             except Exception:
                 log.exception("post_run: token sent_at update failed")
             emails_sent += 1
-            on_progress(f"Post-run: emailed {mgr.display} ({len(owner_rows)} items)",
-                        level="info")
+            on_progress(
+                f"Post-run: emailed {mgr.display} "
+                f"({counts['rejected']} to review, "
+                f"{counts['accepted']} accepted, "
+                f"{counts['deferred']} deferred)",
+                level="info",
+            )
         else:
             skipped.append(f"{mgr.display} (Front send failed)")
             on_progress(f"Post-run: Front send failed for {mgr.display}", level="warning")
