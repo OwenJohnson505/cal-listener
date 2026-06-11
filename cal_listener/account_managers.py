@@ -117,25 +117,34 @@ def _normalize(s: str) -> str:
 
 
 def resolve_review_owner(customer_name: str, profile_data: Optional[dict]) -> Manager:
-    """Customer 360 wins → suffix detect → ad-hoc default."""
+    """Customer 360 wins → suffix detect → ad-hoc default.
+
+    Spec confirmation:
+    - If C360 has an explicit account_manager we recognise → use it.
+    - If C360 has an UNRECOGNISED value (or blank) → treat as 'no
+      mapping' and fall through to suffix detection.
+    - If customer isn't in C360 at all → suffix detection.
+    - Suffix detection's own default is ad-hoc.
+    """
     if profile_data:
         explicit = profile_data.get("account_manager")
         if explicit:
             v = _normalize(str(explicit))
-            # Direct alias hit
-            if v in _ALIASES:
-                return _ALIASES[v]
-            # Loose prefix match against display name ("Kyle A" startswith "kyle")
-            for mgr in (KATIE, KYLE, JAMIE, STEVEN):
-                if v.startswith(mgr.display.lower()):
-                    return mgr
-            # Loose prefix match against email local-part
-            for mgr in (KATIE, KYLE, JAMIE, STEVEN, AD_HOC_TEAM):
-                local = mgr.email.split("@", 1)[0]
-                if v.replace(" ", "") == local:
-                    return mgr
-            # Unknown explicit value — treat as ad-hoc rather than re-running suffix
-            return AD_HOC_TEAM
+            if v:
+                # Direct alias hit
+                if v in _ALIASES:
+                    return _ALIASES[v]
+                # Loose prefix match against display name ("Kyle A" startswith "kyle")
+                for mgr in (KATIE, KYLE, JAMIE, STEVEN):
+                    if v.startswith(mgr.display.lower()):
+                        return mgr
+                # Loose prefix match against email local-part
+                for mgr in (KATIE, KYLE, JAMIE, STEVEN, AD_HOC_TEAM):
+                    local = mgr.email.split("@", 1)[0]
+                    if v.replace(" ", "") == local:
+                        return mgr
+                # Unrecognised — fall through to suffix detect (don't
+                # silently bucket to ad-hoc).
     return detect_from_suffix(customer_name)
 
 
