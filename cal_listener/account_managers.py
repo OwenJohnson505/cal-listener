@@ -71,24 +71,70 @@ def strip_suffix(name: str) -> str:
     return s
 
 
+# Aliases people actually use in the wild for the `account_manager` field.
+# Keys are lowercased, whitespace-collapsed; values are Manager objects.
+# Add more entries here if Owen finds new variants in Customer 360.
+_ALIASES: dict[str, Manager] = {
+    # Katie
+    "katie":               KATIE,
+    "katie@cal.delivery":  KATIE,
+    # Kyle (real name in C360 is often "Kyle A" — matches the kylea@ email)
+    "kyle":                KYLE,
+    "kyle a":              KYLE,
+    "kylea":               KYLE,
+    "kyle@cal.delivery":   KYLE,
+    "kylea@cal.delivery":  KYLE,
+    # Jamie
+    "jamie":               JAMIE,
+    "jamie c":             JAMIE,
+    "jamiec":              JAMIE,
+    "jamie chambers":      JAMIE,
+    "jamie@cal.delivery":  JAMIE,
+    "jamiec@cal.delivery": JAMIE,
+    # Steven
+    "steven":              STEVEN,
+    "steven s":            STEVEN,
+    "steven selfe":        STEVEN,
+    "stevenselfe":         STEVEN,
+    "steven@cal.delivery": STEVEN,
+    # Ad-Hoc Team (many spellings)
+    "ad_hoc_team":         AD_HOC_TEAM,
+    "ad-hoc team":         AD_HOC_TEAM,
+    "ad hoc team":         AD_HOC_TEAM,
+    "ad-hoc":              AD_HOC_TEAM,
+    "ad hoc":              AD_HOC_TEAM,
+    "adhoc":               AD_HOC_TEAM,
+    "ad_hoc":              AD_HOC_TEAM,
+    "bookings":            AD_HOC_TEAM,
+    "bookings team":       AD_HOC_TEAM,
+    "team":                AD_HOC_TEAM,
+    "bookings@cal.delivery": AD_HOC_TEAM,
+}
+
+
+def _normalize(s: str) -> str:
+    return " ".join(s.lower().split())
+
+
 def resolve_review_owner(customer_name: str, profile_data: Optional[dict]) -> Manager:
     """Customer 360 wins → suffix detect → ad-hoc default."""
     if profile_data:
         explicit = profile_data.get("account_manager")
         if explicit:
-            v = str(explicit).strip().lower()
-            # Match by key
-            if v in MANAGERS:
-                return MANAGERS[v]
-            # Match by display name
-            for mgr in MANAGERS.values():
-                if mgr.display.lower() == v:
+            v = _normalize(str(explicit))
+            # Direct alias hit
+            if v in _ALIASES:
+                return _ALIASES[v]
+            # Loose prefix match against display name ("Kyle A" startswith "kyle")
+            for mgr in (KATIE, KYLE, JAMIE, STEVEN):
+                if v.startswith(mgr.display.lower()):
                     return mgr
-            # Match by email
-            for mgr in MANAGERS.values():
-                if mgr.email.lower() == v:
+            # Loose prefix match against email local-part
+            for mgr in (KATIE, KYLE, JAMIE, STEVEN, AD_HOC_TEAM):
+                local = mgr.email.split("@", 1)[0]
+                if v.replace(" ", "") == local:
                     return mgr
-            # Unknown explicit value — treat as ad-hoc, NOT suffix-detect
+            # Unknown explicit value — treat as ad-hoc rather than re-running suffix
             return AD_HOC_TEAM
     return detect_from_suffix(customer_name)
 
