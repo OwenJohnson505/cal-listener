@@ -277,8 +277,8 @@ def _filter_deferred_and_decrement(sb, rows: List[dict], run_id: str,
 
 
 def _build_email_body(manager: am.Manager, run_id: str, run_slot: str,
-                      counts: Dict[str, int], review_url: str) -> tuple[str, str]:
-    """Return (subject, plain_body) tailored for this manager.
+                      counts: Dict[str, int], review_url: str) -> tuple[str, str, str]:
+    """Return (subject, plain_body, html_body) tailored for this manager.
 
     counts is a dict with keys 'rejected' / 'accepted' / 'deferred' —
     the per-bucket totals the manager will see in the new 3-bucket
@@ -324,7 +324,41 @@ def _build_email_body(manager: am.Manager, run_id: str, run_slot: str,
         f"minutes you'll get a reminder; after 2 hours Max is copied in.\n\n"
         f"— Cal Toolkit"
     )
-    return subject, plain
+
+    # Polished HTML version — Tiffany-teal CTA, breakdown card, segoe font
+    # to match Outlook's defaults. Built with table-based layout so it
+    # renders correctly in Outlook (which doesn't honour modern CSS).
+    font = "font-family:Segoe UI,Arial,sans-serif"
+    deferred_html_line = (
+        f"<li style='margin:4px 0'><b>{n_deferred}</b> previously deferred by an admin</li>"
+        if n_deferred > 0 else ""
+    )
+    html = (
+        f"<div style='{font};font-size:14px;color:#334155;max-width:560px'>"
+        f"<p style='margin:0 0 14px'>{greeting}</p>"
+        f"<p style='margin:0 0 14px'>"
+        f"Yesterday's DM Daily Check {slot_label} run found "
+        f"<b>{total}</b> item{'s' if total != 1 else ''} for "
+        f"{'your team' if manager.team else 'your accounts'}:</p>"
+        f"<ul style='margin:0 0 16px;padding-left:20px;color:#475569'>"
+        f"<li style='margin:4px 0'><b>{n_review}</b> need{'s' if n_review == 1 else ''} your review "
+        f"(flagged by the rules)</li>"
+        f"<li style='margin:4px 0'><b>{n_accepted}</b> already accepted</li>"
+        f"{deferred_html_line}"
+        f"</ul>"
+        f"<p style='margin:0 0 18px'>"
+        f"<a href='{review_url}' "
+        f"style='background:#0EA5A4;color:#ffffff;padding:11px 22px;"
+        f"border-radius:6px;text-decoration:none;font-weight:600;"
+        f"display:inline-block;{font};font-size:14px'>Open review</a>"
+        f"</p>"
+        f"<p style='margin:0;color:#64748B;font-size:12px'>"
+        f"This link is unique to this run. If you don't act within 30 "
+        f"minutes you'll get a reminder; after 2 hours Max is copied in."
+        f"</p>"
+        f"</div>"
+    )
+    return subject, plain, html
 
 
 def trigger(sb, *, run_id: str, run_slot: str, on_progress) -> Dict[str, Any]:
@@ -457,14 +491,15 @@ def trigger(sb, *, run_id: str, run_slot: str, on_progress) -> Dict[str, Any]:
             skipped.append(f"{owner_key} (token upsert failed)")
             continue
 
-        # Build + send the email
-        subject, plain = _build_email_body(mgr, run_id, run_slot, counts, review_url)
+        # Build + send the email — proper HTML now (no more replace-hack
+        # that produced malformed markup with missing <p> tags).
+        subject, plain, html = _build_email_body(mgr, run_id, run_slot, counts, review_url)
         ok = front_email.send_email(
             sb,
             to=mgr.email,
             subject=subject,
             body=plain,
-            html=plain.replace("\n\n", "</p><p>").replace("\n", "<br>"),
+            html=html,
         )
         if ok:
             # Record sent_at on the token
