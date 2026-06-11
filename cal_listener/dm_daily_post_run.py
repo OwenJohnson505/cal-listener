@@ -297,9 +297,20 @@ def _build_email_body(manager: am.Manager, run_id: str, run_slot: str,
             f"need{'s' if n_review == 1 else ''} your review"
         )
     else:
-        subject = f"DM Daily Check — all {total} item{'s' if total != 1 else ''} current (nothing flagged)"
+        subject = (
+            f"DM Daily Check — all {total} item{'s' if total != 1 else ''} current "
+            f"(nothing flagged)"
+        )
 
     greeting = "Hi team," if manager.team else f"Hi {manager.display.split()[0]},"
+    # The "deferred" line is only included when an admin has actually
+    # deferred something via the admin queue (which means n_deferred > 0
+    # here, since the rule engine never produces a Deferred verdict).
+    # Skipping the line on first runs keeps the email clean.
+    deferred_line = (
+        f"  - {n_deferred} previously deferred by an admin\n"
+        if n_deferred > 0 else ""
+    )
     plain = (
         f"{greeting}\n\n"
         f"Yesterday's DM Daily Check {slot_label} run found {total} "
@@ -307,7 +318,7 @@ def _build_email_body(manager: am.Manager, run_id: str, run_slot: str,
         f"{'your team' if manager.team else 'your accounts'}:\n\n"
         f"  - {n_review} need{'s' if n_review == 1 else ''} your review (flagged by the rules)\n"
         f"  - {n_accepted} already accepted\n"
-        f"  - {n_deferred} deferred\n\n"
+        f"{deferred_line}\n"
         f"Open the review: {review_url}\n\n"
         f"This link is unique to this run. If you don't act within 30 "
         f"minutes you'll get a reminder; after 2 hours Max is copied in.\n\n"
@@ -322,16 +333,33 @@ def trigger(sb, *, run_id: str, run_slot: str, on_progress) -> Dict[str, Any]:
     on_progress("Post-run: building per-manager review packages", level="info")
 
     profiles_by_name = _fetch_customer_profiles(sb)
-    # Fetch ALL rows across all tabs (not just not_accepted). The new
-    # manager review page renders three buckets — Accepted, Rejected
-    # (the flagged ones), Deferred — so each manager needs to see every
-    # row owned by them, not just the rejects.
+    # Fetch ALL rows across all tabs (not just not_accepted). Managers'
+    # review pages now render three buckets — Accepted, Rejected (the
+    # flagged ones), Deferred — so each manager needs to see every
+    # actionable row owned by them, not just the rejects.
     all_rows_raw = _fetch_all_rows(sb)
 
     # Dedupe by Our Ref so a job that appears in multiple DM views
     # (e.g. both 'Katie' and 'Complete') doesn't surface as two rows in
     # the manager's review.
     all_rows = _dedupe_by_ref(all_rows_raw)
+
+    # Filter out the rule engine's "not_eligible" classification. These
+    # are typically Complete jobs / in-progress / things outside the
+    # invoicing review scope — they're informational, not actionable.
+    # Critically: they are NOT "Deferred". Deferred is reserved for
+    # items an admin explicitly pushed off via the admin queue. Putting
+    # not_eligible items into the manager's Deferred bucket conflates
+    # two unrelated concepts (this was the bug that surfaced when
+    # Steven Selfe opened a first-time review and saw 65 'deferred'
+    # items that no admin had ever touched).
+    actionable_rows = [
+        r for r in all_rows
+        if ((r.get("data") or {}).get("tab") or "") != "not_eligible"
+    ]
+    not_eligible_count = len(all_rows) - len(actionable_rows)
+    all_rows = actionable_rows
+
     rows_before_defer = len(all_rows)
 
     # Strip out items admins have deferred via the web admin queue
@@ -340,7 +368,8 @@ def trigger(sb, *, run_id: str, run_slot: str, on_progress) -> Dict[str, Any]:
 
     on_progress(
         f"Post-run: {len(all_rows_raw)} rows in dm_daily_check, "
-        f"{rows_before_defer} after dedupe, "
+        f"{not_eligible_count} not_eligible filtered out, "
+        f"{rows_before_defer} actionable after dedupe, "
         f"{rows_before_defer - len(all_rows)} admin-deferred, "
         f"{len(profiles_by_name)} customer profiles loaded",
         level="info",
@@ -369,6 +398,10 @@ def trigger(sb, *, run_id: str, run_slot: str, on_progress) -> Dict[str, Any]:
 
         # Compute per-bucket counts so the email body shows the manager
         # what's waiting in each of the 3 buckets on the review page.
+        # Note: deferred starts at 0 — the rule engine never produces
+        # a "Deferred" verdict. The Deferred bucket only fills when an
+        # admin explicitly defers an item via the admin queue (then the
+        # web review page reads that back from last_admin_items).
         counts = {"rejected": 0, "accepted": 0, "deferred": 0}
         for r in owner_rows:
             tab = (r.get("data") or {}).get("tab") or ""
@@ -376,8 +409,10 @@ def trigger(sb, *, run_id: str, run_slot: str, on_progress) -> Dict[str, Any]:
                 counts["rejected"] += 1
             elif tab == "accepted":
                 counts["accepted"] += 1
-            else:
-                counts["deferred"] += 1
+            # Anything that's neither not_accepted nor accepted shouldn't
+            # be in actionable_rows (we filtered not_eligible above); if
+            # something slips through we leave it out of counts rather
+            # than miscategorise it as Deferred.
 
         token = secrets.token_urlsafe(24)
         token_row_key = f"{run_id}_{owner_key}_{token[:8]}"
