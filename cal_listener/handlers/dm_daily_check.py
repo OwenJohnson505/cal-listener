@@ -518,13 +518,38 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
         f"Done — {len(summary['views_succeeded'])} views, "
         f"{total_uploaded} rows uploaded to Supabase."
     )
-    on_progress(final_msg, percent=100)
+    on_progress(final_msg, percent=95)
+
+    # Post-run: generate per-manager review tokens + email magic links via
+    # Front. Non-fatal — if Front isn't configured or anything errors, we
+    # still return the existing success summary.
+    post_run_result = None
+    if rc == 0 and total_uploaded > 0:
+        try:
+            from cal_listener import dm_daily_post_run
+            run_id   = (params.get("run_key") or
+                        f"manual_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+            run_slot = params.get("slot") or "manual"
+            post_run_result = dm_daily_post_run.trigger(
+                ctx.sb, run_id=run_id, run_slot=run_slot,
+                on_progress=on_progress,
+            )
+            on_progress(
+                f"Post-run: {post_run_result['emails_sent']} email(s) sent, "
+                f"{post_run_result['tokens_made']} token(s) created",
+                level="info",
+            )
+        except Exception as e:
+            on_progress(f"Post-run failed (non-fatal): {e}", level="warning")
+
+    on_progress("Done", percent=100)
 
     return {
         "ok": rc == 0 and total_uploaded > 0,
         "exit_code": rc,
         "elapsed_seconds": round(elapsed, 1),
         "summary": summary,
+        "post_run": post_run_result,
         "listener_id": ctx.settings.listener_id,
         "message": final_msg,
     }

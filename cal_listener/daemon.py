@@ -185,6 +185,12 @@ class Listener:
             dm_daily_scheduler.start(self.sb)
         except Exception:
             log.exception("dm_daily_scheduler: failed to start")
+        # Follow-up reminder thread (30-min + 2-hr escalations via Front).
+        try:
+            from cal_listener import dm_daily_followup
+            dm_daily_followup.start(self.sb)
+        except Exception:
+            log.exception("dm_daily_followup: failed to start")
         last_reap = 0.0
         try:
             while not self._stop:
