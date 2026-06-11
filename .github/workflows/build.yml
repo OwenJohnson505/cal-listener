@@ -37,6 +37,10 @@ jobs:
 
       - name: Create release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        # Pinned to v1 — softprops/v2 started silently dropping the file
+        # attach between v1.4.16 (worked) and v1.4.17 (broken). v1 has
+        # uploaded reliably for 80+ builds.
+        uses: softprops/action-gh-release@v1
         with:
           files: dist/CalListener.exe
+          fail_on_unmatched_files: true
