@@ -100,6 +100,104 @@ def _fetch_not_accepted_rows(sb) -> List[dict]:
     ]
 
 
+def _fetch_deferred_items(sb) -> Dict[tuple, dict]:
+    """Pull every dm_daily_deferred_items row with runs_remaining > 0.
+
+    These were stamped by an admin via the web admin queue (Defer-N verdict).
+    Returns a {(bt_ref_lower, cust_ref_lower) -> row} map so we can
+    constant-time filter dm_daily_check rows against it.
+    """
+    out: Dict[tuple, dict] = {}
+    try:
+        res = sb.get(
+            "shared_rows?dataset=eq.dm_daily_deferred_items"
+            "&select=row_key,data&limit=5000"
+        )
+    except Exception:
+        log.exception("dm_daily_post_run: deferred_items fetch failed")
+        return out
+    if not isinstance(res, list):
+        return out
+    for row in res:
+        d = (row or {}).get("data") or {}
+        try:
+            remaining = int(d.get("runs_remaining") or 0)
+        except Exception:
+            remaining = 0
+        if remaining <= 0:
+            continue
+        bt   = str(d.get("bt_ref")   or "").lower().strip()
+        cust = str(d.get("cust_ref") or "").lower().strip()
+        if not bt and not cust:
+            continue
+        out[(bt, cust)] = row
+    return out
+
+
+def _filter_deferred_and_decrement(sb, rows: List[dict], run_id: str,
+                                   on_progress) -> List[dict]:
+    """Strip deferred items out of the row set + tick their counter down.
+
+    Each deferred item carries `runs_remaining`; once we skip it in this
+    run we decrement by 1. When it hits 0 the next run will see it again
+    and the item rejoins the manager's email naturally. Idempotent per
+    item per run via the (bt_ref, cust_ref) key.
+    """
+    deferred = _fetch_deferred_items(sb)
+    if not deferred:
+        return rows
+
+    kept: List[dict] = []
+    skipped_keys = set()
+    for row in rows:
+        d = row.get("data") or {}
+        key = (
+            str(d.get("our_ref") or d.get("ref") or d.get("bt_ref") or "")
+                .lower().strip(),
+            str(d.get("cust_ref") or "").lower().strip(),
+        )
+        if key in deferred:
+            skipped_keys.add(key)
+            continue
+        kept.append(row)
+
+    if not skipped_keys:
+        return rows
+
+    on_progress(
+        f"Post-run: skipping {len(skipped_keys)} deferred item"
+        f"{'s' if len(skipped_keys) != 1 else ''} this run",
+        level="info",
+    )
+
+    now = _now_iso()
+    for key in skipped_keys:
+        deferred_row = deferred[key]
+        d = deferred_row.get("data") or {}
+        try:
+            remaining = int(d.get("runs_remaining") or 0)
+        except Exception:
+            remaining = 0
+        new_remaining = max(0, remaining - 1)
+        new_data = dict(d)
+        new_data["runs_remaining"]    = new_remaining
+        new_data["last_skipped_at"]   = now
+        new_data["last_skipped_run"]  = run_id
+        try:
+            sb.upsert("shared_rows", {
+                "dataset":    "dm_daily_deferred_items",
+                "row_key":    deferred_row.get("row_key"),
+                "data":       new_data,
+                "updated_at": now,
+            })
+        except Exception:
+            log.exception(
+                "post_run: failed to decrement deferred item %s",
+                deferred_row.get("row_key"),
+            )
+    return kept
+
+
 def _build_email_body(manager: am.Manager, run_id: str, run_slot: str,
                       row_count: int, review_url: str) -> tuple[str, str]:
     """Return (subject, html_body) tailored for this manager."""
@@ -143,8 +241,18 @@ def trigger(sb, *, run_id: str, run_slot: str, on_progress) -> Dict[str, Any]:
 
     profiles_by_name = _fetch_customer_profiles(sb)
     rows = _fetch_not_accepted_rows(sb)
-    on_progress(f"Post-run: {len(rows)} not_accepted rows, {len(profiles_by_name)} profiles loaded",
-                level="info")
+    rows_before_defer = len(rows)
+    # Strip out items admins have deferred (Defer-N verdict) and
+    # decrement their runs_remaining counter so they reappear at the
+    # right time. Items with runs_remaining == 0 are not in the
+    # deferred set so they pass through normally.
+    rows = _filter_deferred_and_decrement(sb, rows, run_id, on_progress)
+    on_progress(
+        f"Post-run: {rows_before_defer} not_accepted rows "
+        f"({rows_before_defer - len(rows)} deferred), "
+        f"{len(profiles_by_name)} profiles loaded",
+        level="info",
+    )
 
     # Group by review owner
     by_owner: Dict[str, List[dict]] = {}
@@ -154,6 +262,10 @@ def trigger(sb, *, run_id: str, run_slot: str, on_progress) -> Dict[str, Any]:
         prof = profiles_by_name.get(cust.lower().strip())
         mgr = am.resolve_review_owner(cust, prof)
         by_owner.setdefault(mgr.key, []).append(row)
+
+    # Skip managers whose entire row set was deferred — no point sending
+    # them an empty review link.
+    by_owner = {k: v for k, v in by_owner.items() if v}
 
     emails_sent = 0
     tokens_made = 0
