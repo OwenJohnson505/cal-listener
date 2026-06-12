@@ -56,9 +56,13 @@ def _today_key() -> str:
 class DmDailyScheduler(threading.Thread):
     """Background thread that fires DM Daily Check on schedule."""
 
-    def __init__(self, sb, *, daemon: bool = True) -> None:
+    def __init__(self, sb, *, listener_id: str = "", daemon: bool = True) -> None:
         super().__init__(daemon=daemon, name="DmDailyScheduler")
         self._sb = sb
+        # Used by the preferred-listener gate in _fire_slot. Empty string
+        # means "we don't know who we are" and we treat it as "any
+        # listener" to stay backwards compatible.
+        self._listener_id = (listener_id or "").strip().lower()
         self._stop_event = threading.Event()
         # Per-day cache of already-fired slots: { "2026-06-10": {"morning", "afternoon"} }
         self._fired_today: dict[str, set[str]] = {}
@@ -168,9 +172,40 @@ class DmDailyScheduler(threading.Thread):
                 log.info("dm_daily_scheduler: seeded %s as already fired today", slot)
 
     def _fire_slot(self, slot_name: str, slot_dt: datetime) -> None:
+        # Preferred-listener gate. The web UI lets the operator pick which
+        # listener handles scheduled runs — "either" (or unset) means any
+        # listener can. If a specific listener is named and it isn't us,
+        # we skip — the other listener's scheduler will fire instead.
+        cfg = self._load_schedule_config() or {}
+        preferred = str(cfg.get("preferred_listener") or "either").strip().lower()
+        my_id = self._listener_id
+        if preferred not in {"", "either"} and preferred != my_id:
+            log.info(
+                "dm_daily_scheduler: skipping %s slot — preferred_listener=%s, this listener=%s",
+                slot_name, preferred, my_id,
+            )
+            return
+
         run_key = f"{slot_name}_{slot_dt.strftime('%Y%m%d_%H%M')}"
         scheduled_iso = slot_dt.isoformat()
         now_iso = datetime.now(tz=UK_TZ).isoformat()
+
+        # Belt-and-braces dedup: when preferred is "either", both listeners'
+        # schedulers can race here. Check whether a job for this run_key
+        # already exists before inserting a second.
+        try:
+            existing = self._sb.get(
+                f"job_queue?params->>run_key=eq.{run_key}&select=id&limit=1"
+            )
+            if isinstance(existing, list) and existing:
+                log.info(
+                    "dm_daily_scheduler: %s already queued by another scheduler",
+                    run_key,
+                )
+                return
+        except Exception:
+            log.exception("dm_daily_scheduler: dedup check failed; continuing")
+
         # Write the run row first
         self._sb.upsert("shared_rows", {
             "dataset": "dm_daily_runs",
@@ -184,10 +219,16 @@ class DmDailyScheduler(threading.Thread):
             },
             "updated_at": now_iso,
         })
-        # Then queue the job
+        # Then queue the job. params.preferred_listener is what the RPC
+        # `claim_next_job` filters on — only this listener (or any, if
+        # the preference is "either") will be allowed to claim it.
         self._sb.insert("job_queue", {
             "plugin": "dm_daily_check",
-            "params": {"run_key": run_key, "slot": slot_name},
+            "params": {
+                "run_key":            run_key,
+                "slot":               slot_name,
+                "preferred_listener": preferred or "either",
+            },
             "status": "pending",
             "requested_by": "scheduler",
         })
@@ -251,17 +292,19 @@ def _parse_time_today(hhmm: str, now: datetime) -> Optional[datetime]:
 _INSTANCE: Optional[DmDailyScheduler] = None
 
 
-def start(sb) -> None:
+def start(sb, listener_id: str = "") -> None:
     """Start the scheduler thread once. Safe to call multiple times.
 
     `sb` is the listener's `Supabase` HTTP wrapper from `daemon.self.sb`.
+    `listener_id` is needed for the preferred-listener gate so this
+    listener knows whether scheduled slots are for it or for a peer.
     """
     global _INSTANCE
     if _INSTANCE is not None and _INSTANCE.is_alive():
         return
-    _INSTANCE = DmDailyScheduler(sb)
+    _INSTANCE = DmDailyScheduler(sb, listener_id=listener_id)
     _INSTANCE.start()
-    log.info("dm_daily_scheduler: thread started")
+    log.info("dm_daily_scheduler: thread started (listener=%s)", listener_id or "?")
 
 
 def stop() -> None:

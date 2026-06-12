@@ -182,7 +182,7 @@ class Listener:
         # by default; configurable via the Schedule panel in the web app).
         try:
             from cal_listener import dm_daily_scheduler
-            dm_daily_scheduler.start(self.sb)
+            dm_daily_scheduler.start(self.sb, listener_id=self.s.listener_id)
         except Exception:
             log.exception("dm_daily_scheduler: failed to start")
         # Follow-up reminder thread (30-min + 2-hr escalations via Front).
