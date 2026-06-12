@@ -182,13 +182,18 @@ def _fetch_decision_history(ctx, company: str, on_progress) -> dict:
 
 def _fetch_customer_names(ctx, company: str, on_progress) -> list[str]:
     """Pull the TMS customer name list for `company` from Supabase
-    (dataset `customer_profiles`). The desktop's `invoice_store` does
-    the same thing locally; we replicate it here because that module
-    isn't bundled with the listener.
+    (dataset `customer_profiles`). Used by the column-disambiguation
+    engine AND the swap detector — when this returns an empty list
+    swap detection silently fails (the customer column ends up holding
+    cust-ref values and vice versa).
 
-    Returns a deduplicated list of names — both `primary_name` and
-    every entry in `tms_names`. Paginates because PostgREST caps
-    a single GET at 1000.
+    Post-migration (June 2026) the canonical names live on the
+    `tms_name` and `xero_name` fields — `primary_name` and `tms_names`
+    are gone. We read all four (new + legacy) so any stragglers that
+    didn't get migrated still feed the swap detector.
+
+    Returns a deduplicated list. Paginates because PostgREST caps a
+    single GET at 1000.
     """
     target = (company or "").lower()
     PAGE = 1000
@@ -206,7 +211,21 @@ def _fetch_customer_names(ctx, company: str, on_progress) -> list[str]:
             depot = (d.get("depot") or "").lower()
             if depot != target:
                 continue
-            for n in [d.get("primary_name", ""), *(d.get("tms_names") or [])]:
+            candidates = [
+                # Post-migration canonical fields
+                d.get("tms_name"),
+                d.get("xero_name"),
+                # Legacy fallbacks
+                d.get("primary_name"),
+                d.get("clearbooks_name"),
+            ]
+            for alias in (d.get("tms_names") or []):
+                candidates.append(alias)
+            for alias in (d.get("aliases") or []):
+                candidates.append(alias)
+            for alias in (d.get("bank_names") or []):
+                candidates.append(alias)
+            for n in candidates:
                 s = (n or "").strip()
                 if s and s.lower() not in seen:
                     seen.add(s.lower())
@@ -407,18 +426,30 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
             customer = _clean(row.get("customer"))
             cust_ref = _clean(row.get("cust_ref"))
 
-            # Swap detector: if the customer field doesn't look like a
-            # known customer but the cust_ref field DOES, the DM row
-            # was probably entered with the two fields swapped. We
-            # don't auto-correct (could be wrong), just flag for
-            # human review on the web. Catches data-entry errors at
-            # the booking source.
+            # Swap detector + auto-correct: if the customer field
+            # doesn't look like a known customer but the cust_ref field
+            # DOES, the DM row was entered with the two fields swapped
+            # (a recurring data-entry issue at the booking source).
+            #
+            # Previously we just flagged this with suspected_swap=True
+            # and left the values where they were, which meant managers
+            # stared at rows where the "customer" column held the cust
+            # ref and vice versa. Now we ALSO swap them in the row data
+            # so the manager review page shows them in the right column,
+            # while keeping the auto_corrected_swap flag + the original
+            # values for audit so the web can render a clear warning.
             suspected_swap = False
+            auto_corrected_swap = False
+            original_customer = customer
+            original_cust_ref = cust_ref
             if tms_normed:
                 cust_n = _norm_for_match(customer)
                 ref_n  = _norm_for_match(cust_ref)
                 if cust_n and ref_n and cust_n not in tms_normed and ref_n in tms_normed:
                     suspected_swap = True
+                    # Auto-swap so the values land in the right columns.
+                    customer, cust_ref = cust_ref, customer
+                    auto_corrected_swap = True
 
             data = {
                 "view":              view_name,
@@ -433,7 +464,16 @@ def run(params: Dict[str, Any], on_progress, ctx) -> Dict[str, Any]:
                 "_default_decision": default_decision,
                 "tab":               effective,
                 "decision_source":   "user" if user_decision else "rules",
-                "suspected_swap":    suspected_swap,
+                "suspected_swap":      suspected_swap,
+                # Stamped when we actually swapped the two fields. The
+                # web review page should render a visible warning so the
+                # manager knows DM has them the wrong way round at the
+                # booking source.
+                "auto_corrected_swap": auto_corrected_swap,
+                # Audit trail so the original (pre-swap) values are
+                # recoverable if we ever need them.
+                "raw_customer":        original_customer if auto_corrected_swap else None,
+                "raw_cust_ref":        original_cust_ref if auto_corrected_swap else None,
                 "scraped_at":        now_iso,
                 "scraped_by":        ctx.settings.listener_id,
             }

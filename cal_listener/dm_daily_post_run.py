@@ -236,6 +236,93 @@ def _fetch_deferred_items(sb) -> Dict[tuple, dict]:
     return out
 
 
+def _final_swap_check(sb, rows: List[dict], profiles_by_name: Dict[str, dict],
+                      on_progress) -> List[dict]:
+    """Per Owen's spec, a belt-and-braces swap check immediately before
+    the email goes out. Logic:
+
+      1. Does the row's `cust_ref` exactly match any known customer name?
+      2. If it does, check whether the row's `customer` also matches a
+         known customer name.
+      3. If it doesn't, swap the two — the DM row was entered with the
+         columns the wrong way round.
+
+    This re-runs even if the handler-time swap detection already ran, so
+    we catch rows that slipped through (e.g. when the TMS customer list
+    was empty at scrape time, or when a profile has been added to C360
+    between the scrape and the email send).
+
+    Rows that get corrected are updated in place + written back to
+    `dm_daily_check` so the manager review page sees the right values.
+    """
+    if not profiles_by_name:
+        return rows
+
+    # Known customer names = all the keys in the profile map. They've
+    # already been normalised via `_normalize_name` so suffix-stripping
+    # is consistent on both sides of this check.
+    known = set(profiles_by_name.keys())
+    if not known:
+        return rows
+
+    corrected = 0
+    now_iso = _now_iso()
+    for row in rows:
+        d = row.get("data") or {}
+        # Skip rows that already got the swap-correction stamp at scrape
+        # time — no point redoing the work.
+        if d.get("auto_corrected_swap"):
+            continue
+        customer = (d.get("customer") or "").strip()
+        cust_ref = (d.get("cust_ref") or "").strip()
+        if not customer or not cust_ref:
+            continue
+
+        ref_n  = _normalize_name(cust_ref)
+        cust_n = _normalize_name(customer)
+        # Step 1: cust_ref matches a known customer name?
+        if not ref_n or ref_n not in known:
+            continue
+        # Step 2: does the customer field match a customer name too?
+        # If yes, leave it alone — both sides look valid.
+        if cust_n and cust_n in known:
+            continue
+        # Step 3: cust_ref looks like a customer but customer doesn't —
+        # swap them. Write back to Supabase + mutate the row in memory
+        # so the same row used for routing downstream sees the fix.
+        new_data = dict(d)
+        new_data["customer"]              = cust_ref
+        new_data["cust_ref"]              = customer
+        new_data["auto_corrected_swap"]   = True
+        new_data["raw_customer"]          = customer
+        new_data["raw_cust_ref"]          = cust_ref
+        new_data["swap_corrected_phase"]  = "post_run_final_layer"
+        new_data["swap_corrected_at"]     = now_iso
+        try:
+            sb.upsert("shared_rows", {
+                "dataset":    "dm_daily_check",
+                "row_key":    row.get("row_key"),
+                "data":       new_data,
+                "updated_at": now_iso,
+            })
+            row["data"] = new_data  # downstream code uses this list
+            corrected += 1
+        except Exception:
+            log.exception(
+                "post_run: failed to persist swap correction for %s",
+                row.get("row_key"),
+            )
+
+    if corrected > 0:
+        on_progress(
+            f"Post-run: final swap layer corrected {corrected} row"
+            f"{'s' if corrected != 1 else ''} (customer/cust_ref were "
+            f"the wrong way round in DM)",
+            level="info",
+        )
+    return rows
+
+
 def _filter_deferred_and_decrement(sb, rows: List[dict], run_id: str,
                                    on_progress) -> List[dict]:
     """Strip deferred items out of the row set + tick their counter down.
@@ -417,6 +504,12 @@ def trigger(sb, *, run_id: str, run_slot: str, on_progress) -> Dict[str, Any]:
     ]
     not_eligible_count = len(all_rows) - len(actionable_rows)
     all_rows = actionable_rows
+
+    # Final-layer swap check per Owen's spec: walk every row and re-run
+    # the customer/cust_ref swap detection right before routing+email.
+    # Catches rows that escaped the handler-time detection (e.g. empty
+    # TMS list at scrape time, late-added profiles, etc).
+    all_rows = _final_swap_check(sb, all_rows, profiles_by_name, on_progress)
 
     rows_before_defer = len(all_rows)
 
