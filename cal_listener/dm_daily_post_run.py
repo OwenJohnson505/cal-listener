@@ -41,20 +41,44 @@ def _expires_iso(hours: int = 12) -> str:
     return (datetime.now(tz=timezone.utc) + timedelta(hours=hours)).isoformat()
 
 
+_SUFFIX_RE = __import__("re").compile(r"[\s]*(\.{2,}|''|@|¬)\s*$")
+
+
+def _normalize_name(name: Any) -> str:
+    """Strip routing suffixes ('..' / "''" / '@' / '¬') + lowercase + trim.
+
+    Customer 360 stores tms_name WITH the routing suffix on it (Owen marks
+    customers as belonging to a manager that way). DM stores the customer
+    field without the suffix. So if we keyed the lookup map on the raw name
+    we'd miss every customer whose C360 record carries a suffix that DM
+    doesn't (or vice versa) — which is exactly the Jamie bug.
+
+    By normalising both sides through this function the names match
+    regardless of which side carries the routing marker.
+    """
+    if not name:
+        return ""
+    s = str(name)
+    # Strip any trailing routing suffix the operator might have appended
+    s = _SUFFIX_RE.sub("", s)
+    return s.lower().strip()
+
+
 def _fetch_customer_profiles(sb) -> Dict[str, dict]:
-    """Map lowercased name -> profile.data dict for customer-name lookups.
+    """Map normalized name -> profile.data dict for customer-name lookups.
 
     Post-migration (June 2026): the canonical name is `tms_name`. We also
     index `xero_name` (the new alias for what used to be `clearbooks_name`)
     and the legacy `primary_name` / `clearbooks_name` / `tms_names` /
     `aliases` fields in case any stragglers escaped the migration. First
     write to a key wins so the canonical name is preferred.
+
+    All keys are normalised by `_normalize_name` so routing suffixes
+    don't matter — see that function's docstring for the why.
     """
     out: Dict[str, dict] = {}
     def _add(name: Any, profile: dict) -> None:
-        if not name:
-            return
-        k = str(name).lower().strip()
+        k = _normalize_name(name)
         if k and k not in out:
             out[k] = profile
     try:
@@ -409,12 +433,15 @@ def trigger(sb, *, run_id: str, run_slot: str, on_progress) -> Dict[str, Any]:
         level="info",
     )
 
-    # Group by review owner using customer-name routing
+    # Group by review owner using customer-name routing. Both sides go
+    # through _normalize_name so routing suffixes (e.g. the '¬' Owen adds
+    # to Jamie's customers in C360) don't have to be present on both
+    # sides for the lookup to hit.
     by_owner: Dict[str, List[dict]] = {}
     for row in all_rows:
         d = row.get("data") or {}
         cust = d.get("customer") or ""
-        prof = profiles_by_name.get(cust.lower().strip())
+        prof = profiles_by_name.get(_normalize_name(cust))
         mgr = am.resolve_review_owner(cust, prof)
         by_owner.setdefault(mgr.key, []).append(row)
 
